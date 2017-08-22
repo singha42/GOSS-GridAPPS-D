@@ -24,4 +24,7 @@ PNNL Applications (Release Cycle 2)
 -----------------------------------
 
 .. include:: PNNL_Applications.rst
+
+.. include:: StateEstimatorOutline.rst
+
  

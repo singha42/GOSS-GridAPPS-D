@@ -22,7 +22,7 @@ instead of raw SCADA values, for both accuracy and consistency.
 Therefore, the state estimator is not an application but a service in
 GridAPPS-D, sitting between emulated SCADA and the GOSS bus.
 
-|image0|
+|image0x|
 
 Figure 1: The state estimator processes noisy and incomplete
 measurements, then posting estimated voltage (V), current (I), real
@@ -146,7 +146,7 @@ be EPRI’s OpenDSS simulator [3]_; compared to GridLAB-D, it’s more
 tolerant of model errors and provides more diagnostic information about
 model errors.
 
-|image1|
+|image1x|
 
 Figure 2: The Model Validator works with an archive from the state
 estimator, and an off-line power flow model.
@@ -204,6 +204,6 @@ References
 
 .. [6] Pacific Northwest National Laboratory. (2017). *Transactive Energy Simulation Platform (TESP)*. Available: http://tesp.readthedocs.io/en/latest/
 
-.. |image0| image:: PNNL_Apps/media/SE_Service.png
-.. |image1| image:: PNNL_Apps/media/MV_App.png
+.. |image0x| image:: PNNL_Apps/media/SE_Service.png
+.. |image1x| image:: PNNL_Apps/media/MV_App.png
 
