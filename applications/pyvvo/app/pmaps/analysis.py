@@ -9,6 +9,7 @@ import util.helper
 import numpy as np
 import csv
 import time
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 #import datetime
@@ -16,7 +17,13 @@ import pickle
 from matplotlib.ticker import FuncFormatter
 import util.gld
 
+# Set default fonts to Times New Roman for IEEE.
+mpl.rc('font',family='Times New Roman')
+# Ensure gridlines are at the 'bottom'
+plt.rc('axes', axisbelow=True)
+
 # Set some constants for plotting
+'''
 FIGSIZE=(16, 7.5)
 XTICKSIZE=20
 YTICKSIZE=20
@@ -24,6 +31,15 @@ XLABELSIZE=26
 YLABELSIZE=26
 LEGENDFONTSIZE=20
 LEGENDLINEWIDTH=8
+'''
+FIGSIZE=(3.5, 1.64)
+XTICKSIZE=6
+YTICKSIZE=6
+XLABELSIZE=8
+YLABELSIZE=8
+LEGENDFONTSIZE=6
+LEGENDLINEWIDTH=1
+DPI=450
 
 def plotPMAPS():
     """Function to read the read the csv which contains the results from the 
@@ -63,13 +79,31 @@ def plotPMAPS():
     print('Files read and data ingested in {:.1f} seconds.'.format(t1-t0),
           flush=True)
     
+    # Compute single hour percent differences for the three tests
+    # First, sConst and sUnConst compared to TMY2 results
+    diff1 = np.max(((d['sConst']['data'][:, cols.index('realEnergy'), 0]
+                     - d['base']['data'][:, cols.index('realEnergy'), 0]) * 100
+                     / d['base']['data'][:, cols.index('realEnergy'), 0]))
+    diff2 = np.max(((d['sUnConst']['data'][:, cols.index('realEnergy'), 0]
+                     - d['base']['data'][:, cols.index('realEnergy'), 0]) * 100
+                     / d['base']['data'][:, cols.index('realEnergy'), 0]))
+    # Now compare two-week window to TMY2  
+    diff3 = np.max(((d['twoWeek']['data'][:, cols.index('realEnergy'), 0]
+                     - d['base']['data'][:, cols.index('realEnergy'), 0]) * 100
+                     / d['base']['data'][:, cols.index('realEnergy'), 0]))
+    print('Max pct diff, test1 vs TMY2: {}'.format(diff1))
+    print('Max pct diff, test2 vs TMY2: {}'.format(diff2))
+    print('Max pct diff, test3 vs TMY2: {}'.format(diff3))
+    
+    
+    
     # Plot base_2 real energy and ZIP (constrained) real energy on the same plot
     x = d['base']['time'][:, 0]
     y = [d['base']['data'][:, cols.index('realEnergy'), 0],
          d['sConst']['data'][:, cols.index('realEnergy'), 0]]
     plotTimeSeries(x=x, y=y, xl='Time (Typical Year)',
                    yl='Real Energy Cost ($)',
-                   legend=['Base Case', 'ZIP Model'],
+                   legend=['Base Case', 'Test Case'],
                    file='figures/energy_base2_test1')
     
     # Plot base_3 real energy and ZIP (unconstrained) real energy on the same plot
@@ -77,7 +111,7 @@ def plotPMAPS():
          d['sUnConst']['data'][:, cols.index('realEnergy'), 0]]
     plotTimeSeries(x=x, y=y, xl='Time (Typical Year)',
                    yl='Real Energy Cost ($)',
-                   legend=['Base Case', 'ZIP Model'],
+                   legend=['Base Case', 'Test Case'],
                    file='figures/energy_base3_test2')
     
     # Plot base_3 lagging pf and ZIP (two week) lagging on the same plot for
@@ -92,7 +126,7 @@ def plotPMAPS():
          d['twoWeek']['data'][ind1:ind2, cols.index('powerFactorLag'), 0]]
     plotTimeSeries(x=x[ind1:ind2], y=y, xl='Time (Typical Year)',
                    yl='PF Lag Cost ($)',
-                   legend=['Base Case', 'ZIP Model'],
+                   legend=['Base Case', 'Test Case'],
                    file='figures/pfLag_base2_test3',
                    fmt='day')
     
@@ -101,13 +135,13 @@ def plotPMAPS():
          d['twoWeek']['data'][:, cols.index('realEnergy'), 0]]
     plotTimeSeries(x=x, y=y, xl='Time (Typical Year)',
                    yl='Real Energy Cost ($)',
-                   legend=['Base Case', 'ZIP Model'],
+                   legend=['Base Case', 'Test Case'],
                    file='figures/energy_base2_test3')
     
     # Plot energy pct change between base_2 real energy and two week ZIP
     y = [((y[1] - y[0])*100)/y[0]]
     fig = plotTimeSeries(x=x, y=y, xl='Time (Typical Year)',
-                         yl='Pct. Difference in Energy Cost',
+                         yl='Percent Difference in Energy Cost',
                          legend=None,
                          file='figures/pctDiffEnergy_base2_test3',
                          pctDiffFlag=True)
@@ -123,7 +157,7 @@ def plotPMAPS():
     plt.boxplot(y[0])
     
     # Get a historgram
-    plt.figure(figsize=FIGSIZE)
+    plt.figure(figsize=FIGSIZE, dpi=DPI)
     weights=np.ones_like(y[0])/float(len(y[0]))
     bins = np.arange(-45, 85, 5)
     n = plt.hist(y[0], bins=bins, weights=weights, ec='black')
@@ -158,7 +192,7 @@ def plotPMAPS():
                    legend=None,
                    file='figures/pfLagDiff_base2_test3')
     
-    # Plot base case undervoltage violations
+    # Plot base case (TMY2) undervoltage violations
     y = [d['base']['data'][:, cols.index('undervoltage'), 0]]
     plotTimeSeries(x=x, y=y, xl='Time (Typical Year)',
                    yl='Undervoltage Costs ($)',
@@ -210,7 +244,7 @@ def plotPMAPS():
          d['twoWeek']['data'][ind1:ind2, cols.index('realEnergy'), 0]]
     plotTimeSeries(x=x[ind1:ind2], y=y, xl='Time (Typical Year)',
                    yl='Real Energy Cost ($)',
-                   legend=['Base Case', 'ZIP Model'],
+                   legend=['Base Case', 'Test Case'],
                    file='figures/energy_base2_test3_jan',
                    fmt='hour')
     
@@ -219,10 +253,12 @@ def plotPMAPS():
          d['twoWeek']['data'][ind1:ind2, cols.index('powerFactorLag'), 0]]
     plotTimeSeries(x=x[ind1:ind2], y=y, xl='Time (Typical Year)',
                    yl='PF Lag Cost ($)',
-                   legend=['Base Case', 'ZIP Model'],
+                   legend=['Base Case', 'Test Case'],
                    file='figures/pfLag_base2_test3_jan',
                    fmt='hour')
     
+    
+    '''
     # Read logs
     # Hard-code one week
     # weekRows = 24 * 7 + 1
@@ -324,6 +360,7 @@ def plotPMAPS():
                    legend=None,
                    file='figures/temperature_base2_jan',
                    fmt='hour')
+    '''
     
     """
     # Plot base case tap changes
@@ -400,16 +437,15 @@ def plotTimeSeries(x, y, xl, yl, legend, file, xLabelSize=XLABELSIZE,
     plt.rcParams['timezone'] = 'US/Pacific'
     
     # Open figure, set all fonts to bold
-    fig = plt.figure(figsize=FIGSIZE) # in inches!
+    fig = plt.figure(figsize=FIGSIZE, dpi=DPI) # in inches!
     ax = plt.gca()
     setStuff()
     
-    # Thicken the lines if we're looking at less than one week
-    
-    if (x[-1] - x[0]).total_seconds() > 3600 * 24 * 7:
-        w = 1.5
+    # Thicken the lines if we're looking at less than one month
+    if (x[-1] - x[0]).total_seconds() > 3600 * 24 * 31:
+        w = 0.35
     else:
-        w = 4
+        w = 1
     
     # Plot each y vector
     for yD in y:
@@ -432,7 +468,7 @@ def plotTimeSeries(x, y, xl, yl, legend, file, xLabelSize=XLABELSIZE,
         ax.xaxis.set_major_locator(days)
         #ax.xaxis.set_minor_locator(hours)
         ax.xaxis.set_major_formatter(tFmt)
-        ax.get_xaxis().set_tick_params(which='major', width=3, length=10)
+        ax.get_xaxis().set_tick_params(which='major', width=1, length=3)
         #fig.autofmt_xdate()
         plt.xticks(rotation=-35)
     elif fmt == 'hour':
@@ -443,14 +479,16 @@ def plotTimeSeries(x, y, xl, yl, legend, file, xLabelSize=XLABELSIZE,
         ax.xaxis.set_major_locator(days)
         ax.xaxis.set_minor_locator(hours)
         ax.xaxis.set_major_formatter(tFmt)
-        ax.get_xaxis().set_tick_params(which='major', width=3, length=10)
+        ax.get_xaxis().set_tick_params(which='major', width=1, length=3)
         #fig.autofmt_xdate()
         #plt.xticks(rotation=-35)
         
     
     # Axis labels:
-    plt.xlabel(xl, fontsize=xLabelSize, fontweight='bold')
-    plt.ylabel(yl, fontsize=yLabelSize, fontweight='bold')
+    plt.xlabel(xl, fontsize=xLabelSize, fontweight='bold',
+               fontname='Times New Roman')
+    plt.ylabel(yl, fontsize=yLabelSize, fontweight='bold',
+               fontname='Times New Roman')
     #plt.xticks(rotation=-20)
     #plt.title('Real Energy Cost vs. Time for Base Case (TMY3) and Test 1 (Seasonal constrained)',
     #          fontsize=20, fontweight='bold')
@@ -546,7 +584,8 @@ def voltageViolations(t1, t2):
                    fmt='hour')
     
 if __name__ == '__main__':
-    #plotPMAPS()
+    plotPMAPS()
     # Get voltage violations
-    voltageViolations(t1 = util.helper.tsToDT(ts='2016-01-05 00:00:00 PST'),
-                      t2 = util.helper.tsToDT(ts='2016-01-06 01:00:00 PST'))
+    #voltageViolations(t1 = util.helper.tsToDT(ts='2016-01-05 00:00:00 PST'),
+    #                  t2 = util.helper.tsToDT(ts='2016-01-06 01:00:00 PST'))
+    #openFig('figures/undervoltage_base2_jan.fig.pickle')
