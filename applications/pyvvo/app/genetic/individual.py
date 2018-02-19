@@ -10,10 +10,10 @@ from glm import modGLM
 import util.gld
 import util.helper
 import util.constants
-import util.db
 import math
 import os
 import copy
+from itertools import chain
 
 # Define cap status, to be accessed by binary indices.
 CAPSTATUS = ['OPEN', 'CLOSED']
@@ -26,13 +26,17 @@ TAPSIGMAPCT = 0.1
 # rounds to one. Therefore, we should maintain the previous state if the draw
 # rounds to one.
 CAPTRIANGULARMODE = 0.8
+# reg, cap control settings for each value of individual's controlFlag input.
+CONTROL = [('MANUAL', 'MANUAL'), ('OUTPUT_VOLTAGE', 'VOLT'),
+           ('OUTPUT_VOLTAGE', 'VAR'), ('OUTPUT_VOLTAGE', 'VARVOLT'),
+           ('MANUAL', 'MANUAL')]
  
 class individual:
     
-    def __init__(self, uid, starttime, stoptime, timezone, database, voltFiles,
+    def __init__(self, uid, starttime, stoptime, timezone, dbObj, recorders,
+                 recordMode,
                  reg=None, regFlag=5, cap=None, capFlag=5, regChrom=None, 
-                 capChrom=None, parents=None, controlFlag=0,
-                 recordInterval=60, gldPath=None):
+                 capChrom=None, parents=None, controlFlag=0, gldPath=None):
         """An individual contains information about Volt/VAR control devices
         
         Individuals can be initialized in two ways: 
@@ -48,11 +52,7 @@ class individual:
             stoptime: "..." end 
             timezone: string representing timezone, as it would appear in 
                 GridLAB-D's tzinfo.txt. Example: 'PST+8PDT'
-            database: Dictionary to be passed to the util/db.db class
-                constructor. NOTE: 
-            voltFiles: list of filenames of files which monitor voltage. 
-                Should be output from group_recorder. Used to evaluate voltage
-                violations.
+            dbObj: Initialized object of util/db.db class
             reg: Dictionary as described in the docstring for the gld module.
             
                 Note possible tap positions be in interval [-lower_taps,
@@ -114,7 +114,40 @@ class individual:
                     MANUAL to avoid letting them switch at initialization
                 
             NOTE: If the controlFlag is not 0, the regFlag and capFlag must
-                be set to 3. 
+                be set to 3.
+                
+            recorders: dictionary of recorder objects. Top level objects 
+				should be a list of dictionaries or a dictionary. Each lower
+				level dictionary should have two keys: 'properties' and
+				'objType.' objType can be 'recorder' or 'group_recorder'. 
+				properties should be a dictionary and will be passed directly
+				to modGLM.addMySQLRecorder or modGLM.addMySQLGroup_Recorder.
+                
+                Possible keys:
+                    energy: dictionary describing recorder used to measure
+                        total feeder energy
+                    power: dictionary describing recorder used to measure
+                        total feeder power.
+                    triplexVoltage: dictionary describing group_recorder for
+                        recording triplex voltages.
+                        *NOTE: we'll be recording 'measured_voltage_12' which
+                            at present is only valid for triplex_load
+                            objects.
+                            
+                *NOTE: regulators and capacitors recorders will be created by
+                    reading the cap and reg inputs. The interval will be taken
+                    from the 'energy' table.    
+                *NOTE: regulators will NOT be recorded if the controlFlag is 0,
+                    as there is no need to track position/tap count.
+                *NOTE: all regulators should use the same table. 
+                *NOTE: capacitors will NOT be recorded if the controlFlag is 0,
+                    as there is no need to track status/switch count.
+                *NOTE: all capacitors should use the same table.
+                
+            recordMode: mode for recording mysql recorders. 'a' for append or
+                'w' to purge data before writing. Append will reduce overhead,
+                but you had better make sure duplicate data isn't inserted by
+                accident.
             
         TODO: add controllable DERs
                 
@@ -136,13 +169,13 @@ class individual:
         self.gldPath = gldPath
         
         # set database object
-        self.dbObj = util.db.db(**database)
+        self.dbObj = dbObj
+        
+        # set recordMode
+        self.recordMode = recordMode
         
         # Set the control flag
         self.controlFlag = controlFlag
-        
-        # Assign voltFiles
-        self.voltFiles = voltFiles
         
         # Assign reg and cap dicts. Perform a deepcopy, since an individual
         # will modify its own copy of the given reg and cap definitions.
@@ -151,15 +184,17 @@ class individual:
         
         # Assign the unique identifier.
         self.uid = uid
+        # We'll use the prefix to uniquely identify tables.
+        self.tableSuffix = '_' + str(uid)
         
         # Parent tracking is useful to see how well the GA is working
         self.parents = parents
         
-        # Recording inverval
-        self.recordInterval = recordInterval
-        
         # When writing model, output directory will be saved.
         self.outDir = None
+        
+        # Set recorders property
+        self.recorders = copy.deepcopy(recorders)
         
         # If not given a regChrom or capChrom, generate them.
         if (regChrom is None) and (capChrom is None):
@@ -191,11 +226,7 @@ class individual:
         self.stoptime = stoptime
         self.stop_str = stoptime.strftime(util.constants.DATE_TZ_FMT)
         # Full path to output model.
-        self.model = None
-        # Table information
-        self.swingData = None
-        self.regData = None
-        self.capData = None
+        self.modelPath = None
         
         # When the model is run, output will be saved.
         self.modelOutput = None
@@ -249,7 +280,7 @@ class individual:
         
         return s
         
-    def genRegChrom(self, flag, updateCount=True):
+    def genRegChrom(self, flag):
         """Method to randomly generate an individual's regulator chromosome
         
         INPUTS:
@@ -263,13 +294,10 @@ class individual:
                     reg input's 'prevState'
                 4: Regulator state given in reg input's 'newState' - just need
                     to generate chromosome and count tap changes
-                5: Regulator tap positions will be determined randomly 
-            updateCount: Flag (True or False) to indicate whether or not the
-                individual's tapChangeCount should be updated. When using this
-                function to generate an individual, this should generally be
-                set to True. However, when updating a baseline model (like one
-                that uses volt_var_control) which computes its tap changes 
-                elsewhere, set updateCount to False.
+                5: Regulator tap positions will be determined randomly
+                
+        NOTE: the individual's controlFlag will be used to determine whether or
+            not the individual's tapChangeCount should be updated.
         """
         # Initialize chromosome for regulator and dict to store list indices.
         self.regChrom = ()
@@ -351,8 +379,10 @@ class individual:
                 self.reg[r]['phases'][phase]['newState'] = \
                     util.gld.translateTaps(lowerTaps=v['lower_taps'], pos=newState)
                     
-                # Increment the tap change counter (previous pos - this pos)
-                if updateCount:
+                # Increment the tap change counter (previous pos - this pos) if
+                # this individual is using MANUAL control. Otherwise, tap
+                # changes must be computed after the model run.
+                if self.controlFlag == 0:
                     self.tapChangeCount += \
                         abs(self.reg[r]['phases'][phase]['prevState']
                             - self.reg[r]['phases'][phase]['newState'])
@@ -363,7 +393,7 @@ class individual:
                 # Increment start index.
                 s += len(binTuple)
                 
-    def genCapChrom(self, flag, updateCount=True):
+    def genCapChrom(self, flag):
         """Method to generate an individual's capacitor chromosome.
         
         INPUTS:
@@ -378,14 +408,10 @@ class individual:
                 4: Capacitor state given in cap input's 'newState' - just need
                     to generate chromosome and count switching events
                 5: Capacitor positions will be determined randomly.
-            updateCount: Flag (True or False) to indicate whether or not the
-                individual's capSwitchCount should be updated. When using this
-                function to generate an individual, this should generally be
-                set to True. However, when updating a baseline model (like one
-                that uses volt_var_control) which computes its switch changes 
-                elsewhere, set updateCount to False.
                 
-                
+        NOTE: the individual's controlFlag will be used to determine whether or
+            not the individual's capSwitchCount should be updated.
+            
         OUTPUTS:
             modifies self.cap, sets self.capChrom
         """
@@ -444,7 +470,7 @@ class individual:
                 self.cap[c]['phases'][phase]['chromInd'] = ind
                 
                 # Increment the switch counter if applicable
-                if (updateCount
+                if (self.controlFlag == 0
                     and ((self.cap[c]['phases'][phase]['newState']
                           != self.cap[c]['phases'][phase]['prevState']))):
                     
@@ -495,10 +521,11 @@ class individual:
                     
                     self.capSwitchCount += 1
                 
-    def writeModel(self, strModel, inPath, outDir, recordInterval=None):
+    def writeModel(self, strModel, inPath, outDir):
         """Create a GridLAB-D .glm file for the given individual by modifying
         setpoints for controllable devices (capacitors, regulators, eventually
-        DERs)
+        DERs) and adding all requisite recorders. Everything else in the model
+        is considered up to date and ready to go.
         
         INPUTS:
             self: constructed individual
@@ -507,139 +534,164 @@ class individual:
             outDir: directory to write new model to. Filename will be inferred
                 from the inPath, and the individuals uid preceded by an
                 underscore will be added
-            dumpGroup: Name of group used for triplex_loads.
-            recordInterval: Interval to record things like energy, tapchange,
-                capswitch, etc. which typically only need recorded once per
-                model. If None, the difference between stoptime and starttime
-                will be used (so we only record once)
                 
         OUTPUTS:
-            Path to new model after it's created
+            Writes model to file
         """
-        if not recordInterval:
-            # Get the model runtime - we only need to record regulator tap 
-            # changes and capacitor changes at the end of simulation.
-            modelDelta = (util.helper.dtToUTC(self.stoptime)
-                          - util.helper.dtToUTC(self.starttime))
-            recordInterval = modelDelta.total_seconds()
-            
-        # Check if directory exists - if not, create it.
-        if not os.path.isdir(outDir):
-            os.mkdir(outDir)
-        
         # Assign output directory.
         self.outDir = outDir
         
         # Get the filename of the original model and create output path
-        model = \
-            modGLM.modGLM.addFileSuffix(inPath= os.path.basename(inPath),
+        modelPath = \
+            modGLM.modGLM.addFileSuffix(inPath=os.path.basename(inPath),
                                             suffix=str(self.uid))
         
         # Track the output path for running the model later.
-        self.model = model
+        self.modelPath = modelPath
         
         # Instantiate a modGLM object.
         writeObj = modGLM.modGLM(strModel=strModel, pathModelIn=inPath,
-                                pathModelOut=(outDir + '/' + model))
+                                pathModelOut=(outDir + '/' + modelPath))
         
-        # Update the clock
-        writeObj.updateClock(starttime=self.start_str, stoptime=self.stop_str,
-                             timezone=self.timezone)
+        # Set control for regulators and capacitors.
+        regControl, capControl = CONTROL[self.controlFlag]
         
-        # Update the swing node to a meter and get it writing power to a table
-        # TODO: swing table won't be the only table.
-        # Compute
-        o = writeObj.recordSwing(suffix=self.uid,
-                                 powerInterval=self.recordInterval,
-                                 energyInterval=recordInterval)
-        self.swingData = o
-        
-        # TODO: Uncomment when ready
-        '''
-        # Record triplex nodes
-        o = writeObj.recordTriplex(suffix=self.uid)
-        self.triplexTable = o['table']
-        self.triplexColumns = o['columns']
-        self.triplexInterval = o['interval']
-        ''' 
-        
-        # Take control specific actions.
-        if self.controlFlag == 0:
-            regControl = 'MANUAL'
-            capControl = 'MANUAL'
-        elif (self.controlFlag > 0):
-            # Need to record regulators and capacitors to track state changes
-            # and ending positions. Define necessary data.
-            self.capData = {'table': 'cap_' + str(self.uid),
-                            'changeColumns': util.gld.CAP_CHANGE_PROPS,
-                            'stateColumns': util.gld.CAP_STATE_PROPS,
-                            'interval': recordInterval}
-            
-            self.regData = {'table': 'reg_' + str(self.uid),
-                            'changeColumns': util.gld.REG_CHANGE_PROPS,
-                            'stateColumns': util.gld.REG_STATE_PROPS,
-                            'interval': recordInterval}
-            
-            if self.controlFlag == 1:
-                regControl = 'OUTPUT_VOLTAGE' 
-                capControl = 'VOLT'
-            elif self.controlFlag == 2:
-                regControl = 'OUTPUT_VOLTAGE' 
-                capControl = 'VAR'
-            elif self.controlFlag == 3:
-                regControl = 'OUTPUT_VOLTAGE' 
-                capControl = 'VARVOLT'
-            elif self.controlFlag == 4:
-                # If we're looking at a VVO scheme, we need to add a VVO
-                # object.
-                # TODO: This is SUPER HARD-CODED to only work for the
-                # R2-12-47-2 feeder. Eventually, this needs made more flexible.
-                
-                # Set controls to MANUAL to avoid devices switching on
-                # initialization.
-                regControl = 'MANUAL'
-                capControl = 'MANUAL'
-                # NOTE: this method creates a player file... annoying.
-                self.vvoPlayer = writeObj.addVVO(starttime=self.start_str)
-            
-        # Set regulator and capacitor control schemes, and add recorders if
-        # necessary.
         for r in self.reg:
-            # Modify control setting
+            # Modify control setting.
             self.reg[r]['Control'] = regControl
-            
-            # Add recorders if needed
-            if self.controlFlag > 0:
-                writeObj.addMySQLRecorder(parent=r,
-                                          table=self.regData['table'],
-                                          properties=(self.regData['changeColumns']
-                                                      + self.regData['stateColumns']),
-                                          interval=self.regData['interval'])
-                
+
         for c in self.cap:
-            # Modify control settings
+            # Modify control setting.
             self.cap[c]['control'] = capControl
-            
-            # Add recorders if needed
-            if self.controlFlag > 0:
-                writeObj.addMySQLRecorder(parent=c,
-                                          table=self.capData['table'],
-                                          properties=(self.capData['changeColumns']
-                                                      + self.capData['stateColumns']),
-                                          interval=self.capData['interval'])
             
         # Change capacitor and regulator statuses/positions and control.
         writeObj.commandRegulators(reg=self.reg)
         writeObj.commandCapacitors(cap=self.cap)
         
+        # If we're using GridLAB-D's volt_var_controller, add it to the model
+        if self.controlFlag == 4:
+            # TODO: This is SUPER HARD-CODED to only work for the
+            # R2-12-47-2 feeder. Eventually, this needs made more flexible.
+            # NOTE: this method creates a player file... annoying.
+            self.vvoPlayer = writeObj.addVVO(starttime=self.start_str)
+            
+        # Add the power and energy recorders, track their tables.
+        self.powerTable = self.addRecorder(recordDict=self.recorders['power'],
+                                           writeObj=writeObj)
+        self.energyTable = self.addRecorder(recordDict=self.recorders['energy'],
+                                            writeObj=writeObj)
+        
+        # Add voltage recorder(s):
+        self.triplexTable = \
+            self.addRecorder(recordDict=self.recorders['triplexVoltage'],
+                             writeObj=writeObj)
+            
+        # Add capacitor and regulator recorders if the controlFlag > 0
+        if self.controlFlag > 0:
+            # If we're not in manual control, we need to record counts and
+            # state for regulators and capacitors.
+            
+            # Grab the time interval from the energy table.
+            tInt = self.recorders['energy']['properties']['interval']
+            
+            # TODO: The functionality of building regulator and capacitor 
+            # recorder dicionaries probably belongs in util.gld.
+            
+            # Loop over regulators and add recorders.
+            for reg in self.reg:
+                # Build the property list.
+                propList = \
+                    list(chain.from_iterable(('tap_' + p + '_change_count',
+                                              'tap_' + p) \
+                                             for p in self.reg[reg]['phases']))
+                # Build the dictionary defining the recorder.
+                recordDict = {'objType': 'recorder',
+                              'properties': {'parent': reg,
+                                             'table': 'reg',
+                                             'interval': tInt,
+                                             'propList': propList,
+                                             'limit': -1}
+                              }
+                
+                # Add the recorder.
+                tr = self.addRecorder(recordDict=recordDict, writeObj=writeObj)
+            
+            # Track the regulator table.
+            self.regTable = tr
+                
+            # Loop over capacitors and add recorders.
+            for cap in self.cap:
+                # Build the property list.
+                propList = \
+                    list(chain.from_iterable(('cap_' + p + '_switch_count',
+                                              'switch' + p) \
+                                             for p in self.cap[cap]['phases']))
+                # Build the dictionary defining the recorder.
+                recordDict = {'objType': 'recorder',
+                              'properties': {'parent': cap,
+                                             'table': 'cap',
+                                             'interval': tInt,
+                                             'propList': propList,
+                                             'limit': -1,
+                                             }
+                              }
+                
+                # Add the recorder
+                tc = self.addRecorder(recordDict=recordDict, writeObj=writeObj)
+                
+                
+            # Track the capacitor table
+            self.capTable = tc
+        
         # Write the modified model to file.
         writeObj.writeModel()
-    
+        
+    def addRecorder(self, recordDict, writeObj):
+        """Helper function to add a recorder object from self.recorders to a
+        model. Returns table name (modified based on UID) and list of columns.
+        """
+        # Make a copy of the recordDict (otherwise, if the individual is reused
+        # we end up continually tacking the tableSuffix)
+        rD = copy.deepcopy(recordDict)
+        # Add '_<uid>' to table name.
+        rD['properties']['table'] = (rD['properties']['table']
+                                     + self.tableSuffix)
+        
+        # Add the recordMode to the dictionary
+        rD['properties']['mode'] = self.recordMode
+        
+        # recorders and group_recorders need handled differently.
+        if rD['objType'] == 'recorder':
+            # Add the recorder.
+            # TODO: This function will probably be adapted to add a return for
+            # column names. When that happens, need to adapt this.
+            writeObj.addMySQLRecorder(**rD['properties'])
+            # In this case, we can grab the columns directly from the
+            # rD.
+            cols = rD['properties']['propList']
+            # At the time of writing, regular mysql recorders cannot specify a
+            # complex part.
+            complex_part = []
+        elif rD['objType'] == 'group_recorder':
+            # Add the recorder.
+            writeObj.addMySQLGroup_Recorder(**rD['properties'])
+            # Currently, with a group_recorder we don't care about the columns,
+            # since there's one or more columns for each object within the
+            # group we're recording.
+            cols = []
+            complex_part = rD['properties']['complex_part']
+        
+        # Return. 
+        return {'table': rD['properties']['table'],
+                'columns': cols,
+                'complex_part': complex_part,
+                'type': rD['objType']}
+        
     def runModel(self):
         """Function to run GridLAB-D model.
         """
         self.modelOutput = util.gld.runModel(modelPath=(self.outDir + '/'
-                                                        + self.model),
+                                                        + self.modelPath),
                                              gldPath=self.gldPath)
         # If a model failed to run, print to the console.
         if self.modelOutput.returncode:
@@ -667,49 +719,47 @@ class individual:
         
         # For other control schemes, we need to get the state change and state
         # information from the database.
-        # Update the regulator tap change count.
+        # Update the regulator tap change count. Note we've already ensured
+        # the change properties are recorded.
         # NOTE: passing stoptime for both times to ensure we ONLY read the 
         # change count at the end - otherwise we might double count.
-        self.tapChangeCount = self.dbObj.sumMatrix(table=self.regData['table'],
-                                                   cols=self.regData['changeColumns'],
-                                                   starttime=stoptime,
-                                                   stoptime=stoptime)
+        self.tapChangeCount = \
+            self.dbObj.sumMatrix(table=self.regTable['table'],
+                                 cols=util.gld.REG_CHANGE_PROPS,
+                                 starttime=stoptime,
+                                 stoptime=stoptime)
         # Update the capacitor switch count
-        self.capSwitchCount = self.dbObj.sumMatrix(table=self.capData['table'],
-                                                   cols=self.capData['changeColumns'],
-                                                   starttime=stoptime,
-                                                   stoptime=stoptime)
+        self.capSwitchCount = \
+            self.dbObj.sumMatrix(table=self.capTable['table'],
+                                 cols=util.gld.CAP_CHANGE_PROPS,
+                                 starttime=stoptime,
+                                 stoptime=stoptime)
         
-        # The 'newState' properties of 'reg' and 'cap' need updated.
-        self.reg = self.dbObj.updateStatus(inDict=self.reg, dictType='reg',
-                                           table=self.regData['table'],
-                                           phaseCols=self.regData['stateColumns'],
-                                           t=stoptime)
+        # The 'newState' properties of 'reg' and 'cap' need updated. Note that
+        # we've already ensure the state properties were recorded.
+        self.reg = \
+            self.dbObj.updateStatus(inDict=self.reg, dictType='reg',
+                                    table=self.regTable['table'],
+                                    phaseCols=util.gld.REG_STATE_PROPS,
+                                    t=stoptime)
         
-        self.cap = self.dbObj.updateStatus(inDict=self.cap, dictType='cap',
-                                           table=self.capData['table'],
-                                           phaseCols=self.capData['stateColumns'],
-                                           t=stoptime)
+        self.cap = \
+            self.dbObj.updateStatus(inDict=self.cap, dictType='cap',
+                                    table=self.capTable['table'],
+                                    phaseCols=util.gld.CAP_STATE_PROPS,
+                                    t=stoptime)
         
-        # Update the regulator and capacitor chromosomes. Note that the counts
-        # have already been updated, so set updateCount to False.
-        self.genRegChrom(flag=4, updateCount=False)
-        self.genCapChrom(flag=4, updateCount=False)
+        # Update the regulator and capacitor chromosomes.
+        self.genRegChrom(flag=4)
+        self.genCapChrom(flag=4)
                             
-    def evalFitness(self, costs, tCol='t', starttime=None, stoptime=None,
-                    voltFlag=True):
+    def evalFitness(self, costs, tCol='t', starttime=None, stoptime=None):
         """Function to evaluate fitness of individual. This is essentially a
             wrapper to call util.gld.computeCosts
         
-        TODO: Add more evaluators of fitness like power factor
-        
         INPUTS:
-            costs: dict with the following fields:
-                energy: price of energy
-                tapChange: cost changing regulator taps
-                capSwitch: cost of switching a capacitor
-                undervoltage: cost of under voltage violations.
-                overvoltage: cost of overvoltage violations
+            costs: dictionary with the following fields:
+               see util/gld.py for full definition.
             tCol: name of time column(s)
             starttime: starttime to evaluate fitness for. If None, uses
                 self.starttime
@@ -724,28 +774,19 @@ class individual:
             
         if stoptime is None:
             stoptime = self.stoptime
-            
-        # Determine voltage violation information.
-        # TODO: Remove this hack once we don't have to use files...
-        if voltFlag:
-            voltFilesDir=self.outDir
-            voltFiles=self.voltFiles
-        else:
-            voltFilesDir=None
-            voltFiles=None
 
         # Compute costs.
         self.costs = util.gld.computeCosts(dbObj=self.dbObj,
-                                           swingData=self.swingData,
+                                           energyTable=self.energyTable,
+                                           powerTable=self.powerTable,
+                                           triplexTable=self.triplexTable,
+                                           tapChangeCount=self.tapChangeCount,
+                                           capSwitchCount=self.capSwitchCount,
                                            costs=costs,
                                            starttime=starttime,
                                            stoptime=stoptime,
                                            tCol=tCol,
-                                           tapChangeCount=self.tapChangeCount,
-                                           capSwitchCount=self.capSwitchCount,
-                                           voltFilesDir=voltFilesDir,
-                                           voltFiles=voltFiles
-                                            )
+                                           )
     
     def writeRunUpdateEval(self, strModel, inPath, outDir, costs):
         """Function to write and run model, update individual, and evaluate
@@ -756,6 +797,9 @@ class individual:
             inPath: see writeModel()
             outDir: see writeModel()
             costs: costs for fitness evaluation. See evalFitness
+            
+        OUTPUTS:
+            list of tables
         """
         # Write the model.
         self.writeModel(strModel=strModel, inPath=inPath, outDir=outDir)
@@ -765,109 +809,3 @@ class individual:
         self.update()
         # Evaluate costs.
         self.evalFitness(costs=costs)
-        
-    def buildCleanupDict(self, truncateFlag=False):
-        """Function to build dictionary to be passed to the 'cleanupQueue' of 
-        the 'cleanup' method.
-        """
-        # Initialize list of tables to clean up.
-        tables = [self.swingData['power']['table'],
-                  self.swingData['energy']['table']]
-        # If we're not in manual control, there are more tables to clean.
-        if self.controlFlag:
-            tables.append(self.capData['table'])
-            tables.append(self.regData['table'])
-            
-        d = {'tables': tables,
-             'files': list(self.voltFiles),
-             'dir': self.outDir}
-        # Add the model file to the file list.
-        d['files'].append(self.model)
-        
-        # If we have a vvo player, add it to the list
-        try:
-            d['files'].append(self.vvoPlayer)
-        except:
-            pass
-        
-        # Set flag for table truncation (rather than deletion)
-        d['truncateFlag'] = truncateFlag
-        
-        # Return.
-        return d
-
-def cleanup(cleanupQueue, dbObj):
-    """Method to cleanup (delete) an individuals files, tables, etc. 
-    
-    As the genetic algorithm grows in sophistication, more output is 
-    created. With so many files and tables floating around, it can
-    simply take forever to clean things up. This function should be called
-    before an individual is deleted.
-    
-    Note this function is specifically formatted to work with threads.
-    
-    INPUTS:
-        cleanupQueue: queue which will have dictionaries inserted into it.
-            Dictionaries should contain a list of tables in 'tables', a list
-            of files in 'files', and a directory to find the files in 'dir'.
-        dbObj: initialized util/db.db class object for managing database
-            connections.
-    """
-    while True:
-        # Extract inputs from the queue.
-        inDict = cleanupQueue.get()
-        
-        # Check input.
-        if inDict is None:
-            # 'None' is the done signal.
-            cleanupQueue.task_done()
-            break
-        
-        # Drop or truncate all tables.
-        if inDict['truncateFlag']:
-            for t in inDict['tables']:
-                dbObj.truncateTable(table=t)         
-        else:
-            for t in inDict['tables']:
-                dbObj.dropTable(table=t)
-
-        # Delete all files.
-        for f in inDict['files']:
-            try:
-                os.remove(inDict['dir'] + '/' + f)
-            except PermissionError:
-                # We don't want a permission error spoiling a long run...
-                # Note that all files should get overwritten by either this
-                # program or GridLAB-D anyways...
-                pass
-            except FileNotFoundError:
-                # Again, don't spoil runs if a file doesn't exist. It's weird
-                # we would ever get here, but oh well I guess.
-                pass
-            
-        # Delete the directory if it's empty.
-        try:
-            os.rmdir(inDict['dir'])
-        except:
-            pass
-        """
-        c = os.listdir(inDict['dir'])
-        
-        if c:
-            try:
-                raise UserWarning(('The directory {} is not empty.\n'
-                                   + 'It still contains {}'.format(inDict['dir'],
-                                                                   c)))
-            except UserWarning as w:
-                print(type(w)) # the exception instance
-                print(w.args) # arguments stored in .args
-                print(w) # may be repetitive
-                
-        else:
-            os.rmdir(inDict['dir'])
-        """
-
-        
-        # Cleanup complete.
-        cleanupQueue.task_done()
-        

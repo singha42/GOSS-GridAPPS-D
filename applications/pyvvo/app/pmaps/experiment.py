@@ -34,7 +34,13 @@ MODEL_BASELINE_2 = partial + r'_baseline_2.glm'
 MODEL_BASELINE_3 = partial + r'_baseline_3.glm'
 MODEL_ZIP = partial + r'_ZIP.glm'
 MODEL_STRIPPED_RECORDER = partial + r'_stripped_recorder.glm'
+MODEL_STRIPPED_SETUP = partial + r'_stripped_setup.glm'
 
+triplex_group_recorder = {'group': CONST.TRIPLEX_GROUP,
+                          'interval': CONST.RECORD_INT,
+                          'limit': -1,
+                          'complex_part': 'MAG'}
+    
 def populatedToAMI(interval=900, group=CONST.TRIPLEX_GROUP):
     """Function to take the full populated GridLAB-D model, and get it ready to
     run in order to generate all the data we need for load modeling.
@@ -337,6 +343,7 @@ def writeRunEvalModel(outDir, starttime, stoptime, fIn, fOut):
     
     return baseInd
 '''
+'''
 def runEvalBaseline(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
                     measureInterval=CONST.ZIP_INTERVAL):
     """Function to run the two populated baseline models and compute their
@@ -577,13 +584,13 @@ def runEvalBaseline(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
     (f.close() for f in fOutput)
     
     print('Threads stopped and files closed. All done.')
+'''
     
 def evaluateZIP(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
                 runInterval=CONST.ZIP_INTERVAL, avgFlag=False, gldPath=None,
                 outDir=CONST.OUTPUT_CONSTRAINED, uid=CONST.UID_CONSTRAINED,
                 zipDir=CONST.ZIP_CONSTRAINED):
-    """Function to run the populated baseline model and the ZIP baseline model,
-    and write output data to file. 
+    """Function to run the ZIP baseline model
     """
     # Setup the models. Note this depends on the existence of MODEL_AMI and 
     # MODEL_STRIPPED. If they don't exist:
@@ -621,32 +628,53 @@ def evaluateZIP(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
     fOutput = open(outDir + '/' + CONST.MODEL_OUTPUT_FILES[CONST.IND_Z],
                    mode='w')
         
-    # Initialize cleanup queue.
-    cleanupQueue = Queue()
-        
-    # Initialize cleanup thread for ZIP
-    tClean = threading.Thread(target=individual.cleanup,
-                              args=(cleanupQueue, dbObj))
-    tClean.start()
-        
     print('Cleanup threads started.')
     
     # Note defaults for setting up models assumes ZIP files are for each hour
-    voltFiles = setupModelForEval(modelIn=MODEL_STRIPPED,
-                                  modelOut=MODEL_STRIPPED_RECORDER,
-                                  replaceClimate=False,
-                                  database=CONST.ZIP_DB,
-                                  starttime=CONST.STARTTIME,
-                                  stoptime=CONST.STOPTIME)
+    setupModelForEval(modelIn=MODEL_STRIPPED,
+                      modelOut=MODEL_STRIPPED_SETUP,
+                      replaceClimate=False,
+                      database=CONST.ZIP_DB,
+                      starttime=CONST.STARTTIME,
+                      stoptime=CONST.STOPTIME)
     print('Stripped model setup for ZIP runs..')
     
     # Get write objects
-    writeZIP = modGLM.modGLM(pathModelIn=MODEL_STRIPPED_RECORDER)
+    writeZIP = modGLM.modGLM(pathModelIn=MODEL_STRIPPED_SETUP)
     
     # Initialize a clock.
     clockObj = util.helper.clock(startStr=starttime, finalStr=stoptime,
                                  interval=runInterval, tzStr=CONST.TIMEZONE)
     
+    # Setup recorders for the model
+    recorders = {
+        'energy': {'objType': 'recorder',
+                   'properties': {'parent': 'network_node',
+                                  'table': 'energy',
+                                  'interval': CONST.ZIP_INTERVAL,
+                                  'propList': ['measured_real_energy',],
+                                  'limit': -1,
+                                  }
+                   },
+        'power': {'objType': 'recorder',
+                  'properties': {'parent': 'network_node',
+                                 'table': 'power',
+                                 'interval': CONST.RECORD_INT,
+                                 'propList': ['measured_real_power',
+                                              'measured_reactive_power'],
+                                 'limit': -1,
+                                }
+                   },
+        'triplexVoltage': {'objType': 'group_recorder',
+                           'properties': {'group': CONST.TRIPLEX_GROUP,
+                                          'prop': 'measured_voltage_12',
+                                          'interval': CONST.RECORD_INT,
+                                          'table': 'triplexVoltage',
+                                          'limit': -1,
+                                          'complex_part': ['MAG',],
+                                          }
+                           }
+        }
     # Instantiate individual - while we don't need all the bells and 
     # whistles of an individual, it has the capability to add recorders, run
     # its own model, evaluate it's own model, etc.
@@ -654,11 +682,11 @@ def evaluateZIP(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
     ZIPInd = individual.individual(starttime=clockObj.start_dt,
                                    stoptime=clockObj.stop_dt,
                                    timezone=CONST.TIMEZONE,
-                                   database=CONST.ZIP_DB,
-                                   voltFiles=voltFiles, reg=CONST.REG,
-                                   cap=CONST.CAP, regFlag=3, capFlag=3,
-                                   controlFlag=4, uid=uid,
-                                   gldPath=gldPath)
+                                   dbObj=dbObj, reg=CONST.REG, cap=CONST.CAP,
+                                   regFlag=3, capFlag=3, controlFlag=4,
+                                   uid=uid, recorders=recorders,
+                                   gldPath=gldPath,
+                                   recordMode='a')
 
     # Loop over time until we've hit the stoptime, running the ZIP model for 
     # each hour.
@@ -673,15 +701,16 @@ def evaluateZIP(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
         writeZIP.addZIP(zipDir=zipDir, starttime=clockObj.start_dt,
                         stoptime=clockObj.stop_dt, avgFlag=avgFlag)
         
-        # Ensure cleanup is done before moving on.
-        cleanupQueue.join()
+        # Update the clock
+        writeZIP.updateClock(starttime=clockObj.start_str,
+                             stoptime=clockObj.stop_str)
         
         try:
             # Run the ZIP model
             ZIPInd.writeRunUpdateEval(strModel=writeZIP.strModel,
-                                      inPath=MODEL_STRIPPED_RECORDER,
+                                      inPath=MODEL_STRIPPED_SETUP,
                                       outDir=outDir, costs=CONST.COSTS)
-        except CalledProcessError:
+        except CalledProcessError as err:
             fail = True
             failCount += 1
             # Model failed.
@@ -710,11 +739,7 @@ def evaluateZIP(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
             for phase, states in data['phases'].items():
                 stateDict[(cap + '_' + phase)] = states[stateKey]
                 
-        csvLogs.writerow(stateDict)    
-        
-        # Build cleanup dictionary and put it in the queue.
-        ZIPClean = ZIPInd.buildCleanupDict(truncateFlag=True)
-        cleanupQueue.put_nowait(ZIPClean)
+        csvLogs.writerow(stateDict)
         
         # Write to log
         if fail:
@@ -732,19 +757,11 @@ def evaluateZIP(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
         # Prep the ZIP model for running.
         ZIPInd.prep(starttime=clockObj.start_dt, stoptime=clockObj.stop_dt)
     
-    # Ensure we're all cleaned up
-    cleanupQueue.join()
-    
-    # Shut down the threads.
-    cleanupQueue.put_nowait(None)
-    tClean.join(timeout=10)
-    
     # Close the files
     fCosts.close()
     fLogs.close()
     fOutput.close()
     
-    print('Cleanup threads stopped and files closed, all done.')
     print('There were {} failures'.format(str(failCount)))
     
     
@@ -787,24 +804,14 @@ def setupModelForEval(modelIn, modelOut, replaceClimate, database,
     writeObj = baselineModel(fIn=modelIn, fOut=modelOut,
                              replaceClimate=replaceClimate)
     
-    # We're going to use tape group_recorders to measure voltage at the
-    # loads/meters. Define the necessary input to 'setup_model'
-    triplex_group_recorder = {'group': CONST.TRIPLEX_GROUP,
-                              'interval': CONST.RECORD_INT,
-                              'limit': -1,
-                              'complex_part': 'MAG'}
-    
     # Setup the models. NOTE: with no outDir defined, these dump file outputs
     # should be exactly the same. 
-    files = writeObj.setupModel(starttime=starttime, stoptime=stoptime,
+    writeObj.setupModel(starttime=starttime, stoptime=stoptime,
                                 timezone=CONST.TIMEZONE, database=database,
-                                triplex_group_recorder=triplex_group_recorder,
                                 vSource=None)
     
     # Write the model
     writeObj.writeModel()
-    
-    return files
 
 '''
 def runGA(starttime=CONST.STARTTIME, stoptime=CONST.STOPTIME,
@@ -1053,7 +1060,7 @@ if __name__ == '__main__':
     
     #s = CONST.STARTTIME
     #e = CONST.STOPTIME
-    runEvalBaseline(starttime=s, stoptime=e)
+    #runEvalBaseline(starttime=s, stoptime=e)
         
     """
     # Run constrained seasonal
@@ -1067,10 +1074,10 @@ if __name__ == '__main__':
                 gldPath=(CONST.GLD_PATH + '/unconstrained'),
                 outDir=CONST.OUTPUT_UNCONSTRAINED, uid=CONST.UID_UNCONSTRAINED,
                 zipDir=CONST.ZIP_UNCONSTRAINED)
+    """
     
     # Run two week rolling average 
     evaluateZIP(starttime=s, stoptime=e, avgFlag=True,
-                gldPath=(CONST.GLD_PATH + '/unconstrained'),
+                gldPath=(CONST.GLD_PATH + '/develop'),
                 outDir=CONST.OUTPUT_2WEEK, uid=CONST.UID_2WEEK,
                 zipDir=CONST.ZIP_2WEEK)
-    """

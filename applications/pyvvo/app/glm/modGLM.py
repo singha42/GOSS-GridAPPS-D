@@ -12,9 +12,7 @@ Created on Jul 27, 2017
 
 import re
 import os
-import datetime
 import util.gld
-import util.constants
 import util.helper
 import csv
 
@@ -75,6 +73,7 @@ class modGLM:
 
         # If strModel is defined, simply set it. Otherwise, read the path in.
         if strModel:
+            # No need to do a copy here since strings are immutable in Python.
             self.strModel = strModel
         else:
             self.strModel = readModel(pathModelIn)
@@ -381,9 +380,9 @@ class modGLM:
         INPUTS:
             objType: object defition --> object objType  {
             properties: dictionary of properties mapped to their values. e.g.
-                {'name': 'zipload_schedule'}
+                {'name': 'zipload_schedule'}.
             place: 'beginning' or 'end' --> this is where object will be placed
-            objStr: if objStr is none, object will be added to self.strModel.
+            objStr: if objStr is None, object will be added to self.strModel.
                 Otherwise, object will be nested into the given string object.
                 
         NOTE: 'place' input does nothing if objStr is not None. Nested object
@@ -399,8 +398,8 @@ class modGLM:
         # Close object. Include semi-colon just in case.    
         s += '};\n'
         
-        if not objStr:
-            # Add string to model
+        if objStr is None:
+            # Add string to model.
             if place == 'beginning':
                 self.strModel = s +  self.strModel
             elif place == 'end':
@@ -608,11 +607,11 @@ class modGLM:
         
         # Create recorders. Power first
         self.addMySQLRecorder(parent=recorderParent, table=powerTable,
-                         properties=util.gld.MEASURED_POWER,
+                         propList=util.gld.MEASURED_POWER,
                          interval=powerInterval)
         # Now energy
         self.addMySQLRecorder(parent=recorderParent, table=energyTable,
-                              properties=util.gld.MEASURED_ENERGY,
+                              propList=util.gld.MEASURED_ENERGY,
                               interval=energyInterval)
         
         # Return the name of the table and powerProperties
@@ -678,7 +677,7 @@ class modGLM:
             
             # Add a mysql recorder
             self.addMySQLRecorder(parent=name, table=table,
-                                  properties=['voltage_12'], interval=interval)
+                                  propList=['voltage_12'], interval=interval)
             
         # Return the table name and columns
         return {'table': table, 'columns': ['voltage_12'], 'interval':interval}
@@ -707,16 +706,16 @@ class modGLM:
                                          'phases': n['phases']['prop'],
                                          'nominal_voltage': n['nominal_voltage']['prop']},
                            place='end')
-            
         
-    def addMySQLRecorder(self, parent, table, properties, interval,
-                    header_fieldnames='name', options=None, limit=-1):
+    def addMySQLRecorder(self, parent, table, propList, interval,
+                         header_fieldnames='name', options=None, mode=None,
+                         limit=-1):
         """Method to add database recorder to end of model
         
         INPUTS:
             parent: name of object to record
             table: database table to save outputs in
-            properties: list of properties to record. Ex: ['power_A',
+            propList: list of properties to record. Ex: ['power_A',
                 'power_B', 'power_C']
             interval: interval in seconds to record
             header_fieldnames: Specifies the header data to store in each
@@ -735,12 +734,12 @@ class modGLM:
                     'object mysql.recorder {{\n'
                     '  parent {parent};\n'
                     '  table "{table}";\n'
-                    '  property {properties};\n'
+                    '  property {propList};\n'
                     '  interval {interval};\n'
                     '  header_fieldnames "{header_fieldnames}";\n'
                     '  limit {limit};\n'
                     ).format(parent=parent, table=table,
-                             properties=('"' + ','.join(properties) + '"'),
+                             propList=('"' + ','.join(propList) + '"'),
                              interval=interval,
                              header_fieldnames=header_fieldnames,
                              limit=limit)
@@ -748,6 +747,11 @@ class modGLM:
         # Add options if included
         if options:
             recorder += '  options {options};\n'.format(options=options)
+            
+        # Add mode if included
+        if mode:
+            recorder += '  mode {mode};\n'.format(mode=mode)
+            
             
         self.strModel = self.strModel + recorder + '}'
         
@@ -779,6 +783,48 @@ class modGLM:
         # Add optional pieces
         if complex_part is not None:
             recorder += '  complex_part "{complex_part}";\n'.format(complex_part=complex_part)
+            
+        # Add to the model
+        self.strModel += recorder + '}'
+        
+    def addMySQLGroup_Recorder(self, group, prop, interval, table,
+                               limit=-1, complex_part=None, mode=None):
+        """Method to add a group_recorder object from the tape module.
+        
+        TODO: Make this better after documentation has been written for the 
+            mysql group_recorder
+            
+        INPUTS:
+            group: groupid of the objects to record. NOTE: GridLAB-D can do 
+                things like "class=meter", but this method will be hard-coded
+                to use "groupid=..."
+            prop: property to measure (property is reserved built-in)
+            interval: interval to record (s)
+            table: name of table. Note that based on the column limit there may
+                be multiple tables which use this prefix.
+            complex_part: LIST of complext parts to record. The MySQL group
+                recorder can measure multiple complex parts. It'll simply add
+                somethign like '_REAL' to the column name. 
+        """
+        # Create first part of string
+        recorder = ('\n'
+                    'object mysql.group_recorder {{\n'
+                    '  group "groupid={group}";\n'
+                    '  property {prop};\n'
+                    '  interval {interval};\n'
+                    '  table "{table}";\n'
+                    '  limit {limit};\n'
+                    ).format(group=group, prop=prop, interval=interval,
+                             table=table, limit=limit)
+        
+        # Add optional pieces
+        if complex_part is not None:
+            # complex parts are seperated by a pipe.
+            complexStr = ' | '.join(complex_part)
+            recorder += '  complex_part "{}";\n'.format(complexStr)
+            
+        if mode is not None:
+            recorder += '  mode {};\n'.format(mode)
             
         # Add to the model
         self.strModel += recorder + '}'
@@ -1016,32 +1062,35 @@ class modGLM:
             self.updateClock(starttime=starttime, stoptime=stoptime,
                                  timezone=timezone)
             
-        # Add groupid to triplex_node objects
+        # Add groupid to triplex_load objects
         if triplexGroup:
             self.addGroupToObjects(objectRegex=TRIPLEX_LOAD_REGEX,
                                    groupName=triplexGroup)
         
+        '''
         # Add group_recorders for triplex group. Note that we have to create
         # two recorders - one for phase 1, one for phase 2. We'll assume
         # there's no need to monitor neutral currents here.
         if triplex_group_recorder:
+            # We're going to make a table for each phase. Note that the MySQL
+            # group recorder will make tables voltage_1_0, voltage_1_1, etc.
             phases = ['voltage_1', 'voltage_2']
             prop = ['measured_' + s for s in phases]
-            files = [s + '.csv' for s in phases]
-            # Loop over the phases 
+            # Loop over the phases
             for ind in range(len(phases)):
                 # Add a group recorder
-                self.addTapeGroup_Recorder(group=triplex_group_recorder['group'],
-                                           prop=prop[ind],
-                                           interval=triplex_group_recorder['interval'],
-                                           file=files[ind],
-                                           limit=triplex_group_recorder['limit'],
-                                           complex_part=triplex_group_recorder['complex_part'])
+                self.addMySQLGroup_Recorder(group=triplex_group_recorder['group'],
+                                            prop=prop[ind],
+                                            interval=triplex_group_recorder['interval'],
+                                            table=phases[ind],
+                                            limit=triplex_group_recorder['limit'],
+                                            complex_part=triplex_group_recorder['complex_part'])
                 
         else:
-            files = None
+            phases = None
         
-        return files
+        return phases
+        '''
         
     def switchControl(self):
         """If file has commented out control options, use them instead.
@@ -1110,7 +1159,8 @@ class modGLM:
             # Get the next match, offsetting by length of new object.
             m = TRIPLEX_METER_REGEX.search(self.strModel,
                                           m.span()[0] + len(tObj['obj']))
-            
+    
+    '''
     def addVoltDumps(self, num, group, mode='polar', outDir=None):
         """Function to add voltage dumps for a given group, times, and interval
         
@@ -1138,7 +1188,9 @@ class modGLM:
             c += 1
             
         return(n)
+    '''
     
+    '''
     def addRuntimeToVoltDumps(self, starttime, stoptime, interval=60):
         """Function to add runtimes to existing voltage dump objects.
         """
@@ -1169,6 +1221,7 @@ class modGLM:
             # Get the next match, offsetting by length of new object.
             m = VOLTDUMP_REGEX.search(self.strModel,
                                           m.span()[0] + len(obj['obj']))
+    '''
             
     def removeObjectsByType(self, typeList=[], objStr='object'):
         """Function to simply remove objects by type.
@@ -1289,7 +1342,7 @@ class modGLM:
             
     def addZIP(self, zipDir, starttime, stoptime, avgFlag=False):
         """Function to read the correct zip model file and apply zip loads to
-        meters. 
+        meters.
         
         NOTE: At the moment, this will only work for triplex_meters. Plenty
         of hard-coding in here.

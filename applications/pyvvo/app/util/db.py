@@ -16,6 +16,7 @@ from util import constants
 import operator as op
 import time
 import datetime
+from itertools import chain
 
 # Define how we handle time bounds.
 LEFT_BOUND = '>='
@@ -268,6 +269,46 @@ class db:
             self.dropTable(row[0])
             
         return len(rows)
+    
+    def truncateTableBySuffix(self, suffix):
+        """Function to truncate all tables with a given suffix.
+        
+        TODO and NOTE: This is HARD-CODED to work with the current
+        implementation of the mysql group recorder in GridLAB-D, which creates
+        additional tables for group recorders.
+        """
+        # Get connection and cursor.
+        cnxn, cursor = self.getCnxnAndCursor()
+        try:
+            # HARD-CODE the table suffixes.
+            suff1 = r"%" + suffix.replace("_", r"\_") # escape underscore
+            suff2 = suff1 + r"\__" # tables increment from 0 upward
+            suff3 = suff1 + r"\_index" # there's an index table.
+            
+            # Form query to get tables.
+            q = ("SELECT table_name FROM INFORMATION_SCHEMA.TABLES "
+                 + "WHERE table_schema = '{db}' AND "
+                 + "(table_name LIKE '{suff1}' OR table_name LIKE '{suff2}' "
+                 + "OR table_name LIKE '{suff3}')"
+                ).format(db=self.database, suff1=suff1, suff2=suff2,
+                         suff3=suff3)
+            
+            # Execute the query.
+            cursor.execute(q)
+            # Fetch all the rows. If the tables returned cause a memory
+            # issue, I should quite my job.
+            # NOTE: we could loop over each row and use a seperate connection
+            # to drop the table, but I'd rather do it this way to avoid 
+            # taking up another connection.
+            rows = cursor.fetchall()
+            
+            # Loop over the rows, and trucate the tables.
+            for r in rows:
+                cursor.execute('TRUNCATE TABLE {}'.format(r[0]))
+            
+        finally:
+            # Clean up.
+            self.closeCnxnAndCursor(cnxn, cursor)
         
     def sumComplexPower(self, cols, table, idCol='id', tCol='t',
                         nameCol='name', starttime=None, stoptime=None):
@@ -326,6 +367,64 @@ class db:
         out = {'rowSums': rowSum, 'unit': u}
         return out
     
+    def getComplexFromParts(self, table, cols, idCol='id', tCol='t',
+                        nameCol='name', starttime=None, stoptime=None):
+        """Function to get complex numbers from a table where the real and 
+        imaginary parts are stored in different columns.
+        
+        NOTE: This depends on GridLAB-D's 'real' and 'reactive' terminology.
+        
+        NOTE: For now, assume only two columns (cols). This could easily be
+        adapted for more in the future.
+        """
+        # Ensure there are only two elements in cols
+        if len(cols) != 2:
+            raise UserWarning('For now, only two columns are supported')
+        
+        # Find the indices of the real and reactive components.
+        realList = [('_real' in s.lower()) for s in cols]
+        reactiveList = [('_reactive' in s.lower()) for s in cols]
+        # Here comes the part where we hard-code length of two (.index only
+        # grabs first occurence)
+        try:
+            realInd = realList.index(True)
+            reactiveInd = reactiveList.index(True)
+        except ValueError:
+            raise UserWarning('Columns provided lack _real and/or _reactive')
+        
+        # Prepare query.
+        q = "SELECT {} FROM {}".format(','.join(cols), table)
+        # Add time filter, and ID filter if applicable
+        q += self.getTimeAndIDFilter(starttime=starttime,
+                                     stoptime=stoptime, table=table, 
+                                     idCol=idCol, tCol=tCol,
+                                     nameCol=nameCol)
+            
+        # Get connection and cursor.
+        cnxn, cursor = self.getCnxnAndCursor()
+        
+        # Initialize return
+        out = []
+        try:    
+            # Execute the query.
+            cursor.execute(q)
+            
+            # Fetch the first row.
+            row = cursor.fetchone()
+            # Loop over the rows and sum.
+            while row:
+                # Convert values to complex
+                out.append(complex(row[realInd], row[reactiveInd]))
+                # Advance the cursor.
+                row = cursor.fetchone()
+        finally:   
+            # Clean up.
+            self.closeCnxnAndCursor(cnxn, cursor)
+        
+        # Done.
+        return out
+        
+    
     def sumMatrix(self, table, cols, nameCol='name', idCol='id', tCol='t',
                   starttime=None, stoptime=None):
         """Method to element-wise sum given rows and columns. Note that this also
@@ -375,9 +474,7 @@ class db:
             idCol: Name of the ID column
             tCol: Name of the time column
             starttime: aware datettime object, to create inclusive left hand bound 
-            stoptime: aware datettime object, to create inclusive right hand bound
-            
-        TODO: Maybe include time in results later?
+            stoptime: aware datettime object, to create inclusive right hand bound      
         """
         # Create comma seperated list of columns
         colStr = ','.join(cols)
@@ -404,6 +501,179 @@ class db:
             # Clean up.
             self.closeCnxnAndCursor(cnxn, cursor)
         return rows
+    
+    def getColumnNames(self, table, exceptList=None):
+        """Function to get the columns for a given table.
+        
+        INPUTS:
+            table: string, name of table to get columns for
+            exceptList: list of columns to exclude (like 't' or 'id')
+        
+        SHOW COLUMNS FROM gridlabd.voltage_a_0 WHERE Field <> 'id' AND Field <> 't';
+        select column_name from information_schema.columns where table_name='table'
+        """
+        # Build the query.
+        q = ("SELECT column_name FROM information_schema.columns WHERE "
+             + "table_name = '{}'").format(table)
+             
+        # If we're not including columns, add to the query for filtering.
+        if exceptList is not None:
+            # encase each list element in single quotes.
+            exceptList = ["'" + s + "'" for s in exceptList]
+            # Add to the query
+            q += " AND column_name NOT IN ({})".format(','.join(exceptList))
+        
+        # Get connection and cursor.
+        cnxn, cursor = self.getCnxnAndCursor()
+        
+        try:
+            # Execute the query
+            cursor.execute(q)
+            
+            # Since we're fetching column names, we should be safe to fetch 
+            # all here.
+            rows = cursor.fetchall()
+        finally:
+            # Clean up.
+            self.closeCnxnAndCursor(cnxn, cursor)
+            
+        # Return (database query returns list of single element tuples).
+        return [k[0] for k in rows]
+    
+    
+    def voltViolationsFromGroupRecorder(self, baseTable, lowerBound,
+                                        upperBound, idCol='id', tCol='t',
+                                        starttime=None, stoptime=None):
+        """Function to loop through a group of tables which were created by
+        GridLAB-D's group_recorder and sum up voltage violations.
+        
+        NOTE/TODO: group_recorder will hopefully be changed in March, meaning
+        we can refactor and use SQL queries to do filtering instead of pulling
+        out all the data and checking thresholds. 
+        """
+        # First step is to get the list of tables from the 'index.' Formulate
+        # the query.
+        q = 'SELECT DISTINCT table_name FROM {}'.format(baseTable + '_index')
+        
+        # Get connection and cursor.
+        cnxn, cursor = self.getCnxnAndCursor()
+        # Get the table names.
+        try:
+            # Execute the query, and do a fetchall (if the list of distinct
+            # tables causes a memory issue, we have bigger fish to fry)
+            cursor.execute(q)
+            # Note this will give us a list of tuples with a single element.
+            tables = cursor.fetchall()
+        finally:
+            # Clean up.
+            self.closeCnxnAndCursor(cnxn, cursor)
+        
+        # Initialize return.
+        out = {'high': 0, 'low': 0, 'detail':{}}
+        
+        # Loop over each table and count the values outside of the range.
+        for t in tables:
+            thisOut = self.countValsOutOfRange(table=t[0],
+                                               lowerBound=lowerBound,
+                                               upperBound=upperBound,
+                                               idCol=idCol, tCol=tCol,
+                                               starttime=starttime,
+                                               stoptime=stoptime)
+            
+            # Add this output to the overall output.
+            out['high'] += thisOut['high']
+            out['low'] += thisOut['low']
+            # On the first iteration, simply take the details.
+            if t == tables[0]:
+                out['detail'] = thisOut['detail']
+            else:
+                # Loop and combine.
+                for t in thisOut['detail']:
+                    for k in ('high', 'low'):
+                        out['detail'][t][k] = (out['detail'][t][k]
+                                               + thisOut['detail'][t][k])
+                        
+        return out
+            
+    
+    def countValsOutOfRange(self, table, lowerBound, upperBound,
+                            idCol='id', tCol='t', starttime=None,
+                            stoptime=None):
+        """Function to count values that fall are < lowerBound and 
+        > upperBound
+        
+        NOTE/TODO: In the future, we should change the group_recorder to stop
+        making multiple tables, and instead make one big table with all the
+        information we need. That way, we could perform this filtering directly
+        within MySQL instead of extracting all the data and then filtering.
+        """
+        # Get the columns for the table in question. Include time.
+        cols = self.getColumnNames(table=table, exceptList=[idCol,])
+        
+        timeIndex = cols.index(tCol)
+        
+        # Build column string. Note we need to use back-ticks.
+        colStr = "`" + cols[0] + "`"
+        for col in cols[1:]:
+            colStr += ", `" + col + "`"
+        
+        # Create comma seperated list of columns
+        #colStr = ', '.join(cols)
+        
+        # Create query
+        q = "SELECT {} FROM {}".format(colStr, table)
+        # Add time filter, and ID filter if applicable.
+        # TODO: I'm leaving an error/confusion inducing time-bomb here by 
+        # excluding the nameCol input to getTimeAndIDFilter. If we hit an 
+        # 'ambiguous' time (DST fall back), chaos will ensue. The
+        # getTimeAndIDFilter function was built to work with regular recorders,
+        # and we built the group recorder to match tape (bad move looking back).
+        # At any rate, when the mysql group_recorder gets redone so that its
+        # output looks like regular recorders, this won't be an issue and we 
+        # can add the nameCol input back in.
+        q += self.getTimeAndIDFilter(starttime=starttime,
+                                     stoptime=stoptime, table=table, 
+                                     idCol=idCol, tCol=tCol)
+        
+        # Get connection and cursor.
+        cnxn, cursor = self.getCnxnAndCursor()
+        
+        try:
+            # Initialize the output.
+            out = {'high': 0, 'low': 0, 'detail': {}}
+            
+            # Execute the query
+            cursor.execute(q)
+            
+            # Loop over the rows.
+            row = cursor.fetchone()
+            # Get generator of indices NOT including the time index. Counting
+            # on all rows being the same length.
+            rInd = chain(range(0, timeIndex), range(timeIndex+1, len(row)))
+            while row:
+                # Grab the time, add to detailed return
+                t = row[timeIndex]
+                out['detail'][t] = {'high': [], 'low':[]}
+                
+                # Loop over the data and tally violations.
+                for ind in rInd:
+                    val = row[ind]
+                    if val < lowerBound:
+                        out['low'] += 1
+                        out['detail'][t]['low'].append(cols[ind])
+                    elif val > upperBound:
+                        out['high'] += 1
+                        out['detail'][t]['high'].append(cols[ind])
+                
+                # Advance to the next row
+                row = cursor.fetchone()
+        finally:
+            # Clean up.
+            self.closeCnxnAndCursor(cnxn, cursor)
+            
+        # Return.
+        return out
+        
     
     def updateStatus(self, inDict, dictType, table, phaseCols, t,
                      nameCol='name', idCol='id', tCol='t'):
@@ -793,66 +1063,27 @@ class db:
             
         return idStr
 
-    
-    '''
-    The following function is commented out as it hasn't been updated in a while,
-    and shouldn't be used without a review.
-    
-    def voltageViolations(cursor, table, vLow=228, vHigh=252, vCols=['voltage_12'],
-                          tCol='t', starttime=None, stoptime=None):
-        """Loop through a table of voltages and count voltage violations.
-        
-        TODO: Ideally, finding the violation count would be coded in SQL - 
-            something like 'SELECT COUNT(voltage_12) FROM table WHERE 
-            voltage_12 > 252'
-            Unfortunately, GridLAB-D records the values as strings....
-            
-        TODO: Track number of meters that create the violation.
-        """
-        # Create query
-        q = "SELECT {} FROM {}".format(','.join(vCols), table)
-        
-        # Add time bounds
-        q += timeWhere(tCol=tCol, starttime=starttime, stoptime=stoptime)
-        
-        # Execute query.
-        cursor.execute(q)
-        
-        # Track high and low violations.
-        high = 0
-        low = 0
-        
-        # Fetch the first row, loop until all have been consumed.
-        row = cursor.fetchone()
-        while row:
-            # Only count one violation per object (don't count multiple times if
-            # multiple phases are out of bounds)
-            violation = False
-            # Loop over the columns (phases)
-            for ind in range(len(vCols)):
-                if not violation:
-                    # Get the complex value
-                    v, _ = helper.getComplex(row[ind])
-        
-                    # Increment counters if necessary
-                    if v.__abs__() >= vHigh:
-                        high += 1
-                        violation = True
-                    elif v.__abs__() <= vLow:
-                        low += 1
-                        violation = True
-            
-            # Fetch next row.    
-            row = cursor.fetchone()
-            
-        return {'high': high, 'low': low}
-    '''
-
 if __name__ == '__main__':
-    dbObj = db(pool_size=140)
-    cnxn1, _ = dbObj.getCnxnAndCursor()
-    cnxn2, _ = dbObj.getCnxnAndCursor()
-    cnxn3, _ = dbObj.getCnxnAndCursor()
+    dbObj = db(pool_size=10, database='zip')
+    dbObj.truncateTableBySuffix(suffix='_2')
+    '''
+    cnxn1, crsr1 = dbObj.getCnxnAndCursor()
+    try:
+        crsr1.execute('SELECT * FROM voltage_a_3')
+    except mysql.connector.ProgrammingError as err:
+        # This is the error code for a non-existant table. We should use this
+        # when dealing with group_recorders.
+        if err.errno == 1146:
+            print('success.')
+        else:
+            print('failure')
+    except Exception as err:
+        print(err)
+    '''
+        
+    print('yay')
+    #cnxn2, _ = dbObj.getCnxnAndCursor()
+    #cnxn3, _ = dbObj.getCnxnAndCursor()
     '''
     cnxn = connect()
     dropAllTables(cnxn)

@@ -52,15 +52,24 @@ capacitors={'cap_capbank2a': {'phases': {'A': {'newState': 'CLOSED',
                                          }
                               }
             }
+            
+COST DICTIONARY:
+For evaluating 'costs' of a model, this is what the dictionary should look
+like (see computeCosts for more details):
+
+COSTS = {'realEnergy': 0.00008,
+         'powerFactorLead': {'limit': 0.99, 'cost': 0.1},
+         'powerFactorLag': {'limit': 0.99, 'cost': 0.1},
+         'tapChange': 0.5, 'capSwitch': 2, 'undervoltage': 0.05,
+         'overvoltage': 0.05}
 
 Created on Aug 29, 2017
 
 @author: thay838
 """
 import subprocess
-import csv
 import os
-import util.constants
+import util.helper
 
 # definitions for regulator and capacitor properties
 REG_CHANGE_PROPS = ['tap_A_change_count', 'tap_B_change_count',
@@ -71,6 +80,7 @@ CAP_CHANGE_PROPS = ['cap_A_switch_count', 'cap_B_switch_count',
 CAP_STATE_PROPS = ['switchA', 'switchB', 'switchC']
 MEASURED_POWER = ['measured_power_A', 'measured_power_B', 'measured_power_C']
 MEASURED_ENERGY = ['measured_real_energy']
+TRIPLEX_VOLTAGE = ['measured_voltage_12']
 
 def runModel(modelPath, gldPath=None):
     #, gldPath=r'C:/gridlab-d/develop'):
@@ -88,16 +98,7 @@ def runModel(modelPath, gldPath=None):
     TODO: Add support for command line inputs.
     """
     cwd, model = os.path.split(modelPath)
-    """
-    # Set up the gridlabd path, run model
-    # TODO: Get this adapated for Unix.
-    # NOTE: On Windows, spaces between the '&&'s causes everything to break...
-    cmd = r'set PATH={}/bin;%PATH%'.format(gldPath)
-    cmd += r'&&set GLPATH={0}/share/gridlabd;{0}/lib/gridlabd'.format(gldPath)
-    cmd += r'&&set CXXFLAGS=-I{}/share/gridlabd'.format(gldPath)
-    cmd += r'&&gridlabd'
-    cmd += r' ' + model
-    """
+
     # Setup environment if necessary
     if gldPath:
         # We'll use forward slashes here since GLD can have problems with 
@@ -119,7 +120,8 @@ def runModel(modelPath, gldPath=None):
         env = None
     
     # Run command. Note with check=True exception will be thrown on failure.
-    # TODO: rather than using check=True, handle the event of a GridLAB-D error
+    # TODO: with check=True, a CalledProcessError will be raised. This should
+    # be handled in some way, but probably outside of this function.
     # NOTE: it's best practice to pass args as a list. If args is a list, using
     # shell=True creates differences across platforms. Just don't do it.
     output = subprocess.run(['gridlabd', model], stdout=subprocess.PIPE,
@@ -145,24 +147,26 @@ def inverseTranslateTaps(lowerTaps, pos):
     posOut = pos + lowerTaps
     return posOut
 
-def computeCosts(dbObj, swingData, costs, starttime, stoptime,
-                 voltFilesDir=None,
-                 voltFiles=None, tCol='t', idCol='id', tapChangeCount=None,
-                 tapChangeTable=None, tapChangeColumns=None,
-                 capSwitchCount=None, capSwitchTable=None,
-                 capSwitchColumns=None
-                 ):
+def computeCosts(dbObj, energyTable, powerTable, triplexTable, tapChangeCount,
+                 capSwitchCount, costs, starttime, stoptime, tCol='t',
+                 idCol='id'):
     """Method to compute VVO costs for a given time interval. This includes
     cost of energy, capacitor switching, and regulator tap changing. Later this
     should include cost of DER engagement.
     
     INPUTS:
         dbObj: initialized util/db.db class object
-        swingData: dict with the following fields:
-            table: name of table for getting swing node power.
+        energyTable: dict with the following fields:
+            table: name of table for getting total energy.
             columns: name of the columns corresponding to the swing table.
                 These will vary depending on node-type (substation vs. meter)
-            interval: recording interval (seconds) of the swing table
+        powerTable: dict with 'table' and 'energy' fields for measuring total
+            power in order to compute the power factor. Peak power costs could
+            be included in the future.
+        triplexTable: dict with 'table' and 'complex_part' fields for measuring
+            voltage violations at triplex loads.
+        tapChangeCount: total number of all tap changes.
+        capSwitchCount: total number of all capacitor switching events.
         costs: dictionary with the following fields:
             realEnergy: price of energy in $/Wh
             tapChange: cost ($) of changing one regulator tap one position.
@@ -178,25 +182,8 @@ def computeCosts(dbObj, swingData, costs, starttime, stoptime,
         starttime: starting timestamp (yyyy-mm-dd HH:MM:SS) of interval in
             question.
         stoptime: stopping ""
-        voltFilesDir: Directory of files to be read to determine voltage 
-            violations
-        voltFiles: list of voltFiles (without the path 'head'). Note that files
-            are assumed to monitor the same nodes, just different phases.
         tCol: name of time column. Assumed to be the same for tap/cap tables.
             Only include if a table is given.
-        tapChangeCount: total number of all tap changes. Don't include this 
-            input if tapChangeTable and tapChangeColumns are included.
-        tapChangeTable: table for recording regulator tap changes. Don't
-            include this input if tapChangeCount is specified
-        tapChangeColumns: list of columns corresponding to tapChangeTable for
-            computing total operations. Likely will be
-            ['tap_A_change_count', ...]
-        capSwitchCount: total number of all capacitor switching events. Don't
-            include this if capChangeTable and capChangeColumns are given.
-        capSwitchTable: table for recording capacitor switching events. Don't
-            include this if capSwitchCount is specified.
-        capSwitchColumns: columns of capSwitchTable to sum over to get total 
-            count. Likely to be ['cap_A_switch_count',...]
             
     NOTE: At this point, all capacitors and regulators are assigned the same
     cost. If desired later, it wouldn't be too taxing to break that cost down
@@ -208,12 +195,14 @@ def computeCosts(dbObj, swingData, costs, starttime, stoptime,
     # ENERGY COST
     
     # Read energy database. Note times - this should return a single row only.
-    energyRows = dbObj.fetchAll(table=swingData['energy']['table'],
-                                cols=swingData['energy']['columns'],
+    energyRows = dbObj.fetchAll(table=energyTable['table'],
+                                cols=energyTable['columns'],
                                 starttime=stoptime, stoptime=stoptime)
 
     # Due to time and ID filtering, we should get exactly one row.
-    assert len(energyRows) == 1
+    if len(energyRows) != 1:
+        raise UserWarning(('Something has gone wrong, and there are multiple'
+                           ' energy rows for the same time!'))
     
     # Compute the cost
     costDict['realEnergy'] = energyRows[0][0] * costs['realEnergy']
@@ -223,67 +212,75 @@ def computeCosts(dbObj, swingData, costs, starttime, stoptime,
     costDict['powerFactorLead'] = 0
     costDict['powerFactorLag'] = 0
     
+    # Code below may be necessary if recording 3-phase voltage from a
+    # 'subastation' object instead of a 'meter' object
+    '''
     # Get list of sums of rows (sum three phase power) from the database
-    power = dbObj.sumComplexPower(table=swingData['power']['table'],
-                                  cols=swingData['power']['columns'],
+    # Note the return is a dict with 'rowSums' containing the power values.
+    power = dbObj.sumComplexPower(table=powerTable['table'],
+                                  cols=powerTable['columns'],
+                                  starttime=starttime, stoptime=stoptime)
+    '''
+    
+    # Get complex power
+    power = dbObj.getComplexFromParts(table=powerTable['table'], 
+                                  cols=powerTable['columns'],
                                   starttime=starttime, stoptime=stoptime)
     
     # Loop over each row, compute power factor, and assign cost
-    for p in power['rowSums']:
+    for p in power:
         pf, direction = util.helper.powerFactor(p)
-        # Determine field to use based on whether pf is leading or lagging
-        if direction == 'lag':
-            field = 'powerFactorLag'
-        elif direction == 'lead':
-            field = 'powerFactorLead'
-        
+         
+        # Construct the field. Note that the possible returns of direction are
+        # 'lead' and 'lag'
+        field = 'powerFactor' + 'L' + direction[1:]
         # If the pf is below the limit, add to the relevant cost 
         if pf < costs[field]['limit']:
-            # Cost represents cost of a 0.01 deviation, so multiple violation
+            # Cost represents cost of a 0.01 deviation, so multiply violation
             # by 100 before multiplying by the cost.
             costDict[field] += ((costs[field]['limit'] - pf) * 100
                                 * costs[field]['cost'])
     
     # *************************************************************************
     # TAP CHANGING COST
-    
-    # If tap table and columns given, compute the total count.    
-    if (tapChangeTable and tapChangeColumns and tCol):
-        # Sum all the tap changes.
-        tapChangeCount = dbObj.sumMatrix(table=tapChangeTable,
-                                         cols=tapChangeColumns, tCol=tCol,
-                                         starttime=stoptime, stoptime=stoptime)
-    elif (tapChangeCount is None):
-        assert False, ("If tapChangeCount is not specified, tapChangeTable and"
-                       " tapChangeColumns must be specified!")
         
     # Simply multiply cost by number of operations.   
     costDict['tapChange'] = costs['tapChange'] * tapChangeCount
     
     # *************************************************************************
     # CAP SWITCHING COST
-    
-    # If cap table and columns given, compute the total count.
-    if (capSwitchTable and capSwitchColumns and tCol):
-        # Sum all the tap changes.
-        capSwitchCount = dbObj.sumMatrix(table=capSwitchTable,
-                                         cols=capSwitchColumns, tCol=tCol,
-                                         starttime=stoptime, stoptime=stoptime)
-    elif (capSwitchCount is None):
-        assert False, ("If capSwitchCount is not specified, capSwitchTable and"
-                       " capSwitchColumns must be specified!")
         
     # Simply multiply cost by number of operations.   
     costDict['capSwitch'] = costs['capSwitch'] * capSwitchCount
     
     # *************************************************************************
-    # VOLTAGE VIOLATION COSTS
+    # TRIPLEX VOLTAGE VIOLATION COSTS
+    
+    # Note that the function for determining violations relies heavily on the
+    # operations of GridLAB-D's mysql group_recorder.
+    # TODO: We should change up how we're doing the group_recorder... Just make
+    # a taller table! That way, we don't have to pull out ALL the data and sift
+    # through it, we can use MySQL operations to work on the data and only pull
+    # out the stuff we care about.
+    # TODO: These voltage limits should be input (or defined in config, etc.)
+    # TODO: We might want to hang on to more detail beyond total violations.
+    v = dbObj.voltViolationsFromGroupRecorder(baseTable=triplexTable['table'],
+                                              lowerBound=0.95*240,
+                                              upperBound=1.05*240,
+                                              idCol=idCol, tCol=tCol,
+                                              starttime=starttime,
+                                              stoptime=stoptime)
+    costDict['overvoltage'] = v['high'] * costs['overvoltage']
+    costDict['undervoltage'] = v['low'] * costs['undervoltage']
+    
+    '''
     if voltFilesDir and voltFiles:
         # Get all voltage violations. Use default voltages and tolerances for
         # now.
         v = violationsFromRecorderFiles(fileDir=voltFilesDir, files=voltFiles)
         costDict['overvoltage'] = sum(v['high']) * costs['overvoltage']
         costDict['undervoltage'] = sum(v['low']) * costs['undervoltage']
+    '''
     
     # *************************************************************************
     # DER COSTS
@@ -295,9 +292,10 @@ def computeCosts(dbObj, swingData, costs, starttime, stoptime,
     for _, v in costDict.items():
         t += v
     
-    costDict['total'] = t   
+    costDict['total'] = t
     return costDict
 
+'''
 def violationsFromRecorderFiles(fileDir, files, vNom=120, vTol=6):
     """Function to read GridLAB-D group_recorder output files and compute
     voltage violations. All files are assumed to have voltages for the same
@@ -406,6 +404,7 @@ def getGLDFileHeaders(r):
             raise ValueError('File had unexpected format!')
         
     return line
+'''
 
 '''      
 def voltViolationsFromDump(fName, vNom=120, vTol=6):
