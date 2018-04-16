@@ -13,18 +13,13 @@ import mysql.connector.pooling as pooling
 from mysql.connector import errorcode
 from util import helper
 from util import constants
-import operator as op
 import time
 import datetime
 from itertools import chain
 
 # Define how we handle time bounds.
 LEFT_BOUND = '>='
-LEFT_OTHER = '<'
 RIGHT_BOUND = '<='
-RIGHT_OTHER = '>'
-# Create a lookup table for bounds.
-LOOKUP = {'<': op.lt, '<=': op.le, '==': op.eq, '>=': op.ge, '>': op.gt}
 
 class db:
     """Class to handle database operations in a threadsafe manner. The
@@ -550,6 +545,10 @@ class db:
         NOTE/TODO: group_recorder will hopefully be changed in March, meaning
         we can refactor and use SQL queries to do filtering instead of pulling
         out all the data and checking thresholds. 
+        
+        NOTE: bounds are exclusive for determining violations, in other words,
+        voltages in the set [lowerBound, upperBound] will not incur a
+        violation cost./
         """
         # First step is to get the list of tables from the 'index.' Formulate
         # the query.
@@ -716,8 +715,6 @@ class db:
                 s = 'tap_'
             elif dictType == 'cap':
                 s = 'switch'
-                
-            # TODO: DERs.
             
             # Query the database.
             cursor.execute(q)

@@ -10,10 +10,8 @@ from glm import modGLM
 import util.gld
 import util.helper
 import util.constants
-import math
 import os
 import copy
-from itertools import chain
 
 # Define cap status, to be accessed by binary indices.
 CAPSTATUS = ['OPEN', 'CLOSED']
@@ -34,7 +32,6 @@ CONTROL = [('MANUAL', 'MANUAL'), ('OUTPUT_VOLTAGE', 'VOLT'),
 class individual:
     
     def __init__(self, uid, starttime, stoptime, timezone, dbObj, recorders,
-                 recordMode,
                  reg=None, regFlag=5, cap=None, capFlag=5, regChrom=None, 
                  capChrom=None, parents=None, controlFlag=0, gldPath=None):
         """An individual contains information about Volt/VAR control devices
@@ -143,14 +140,6 @@ class individual:
                 *NOTE: capacitors will NOT be recorded if the controlFlag is 0,
                     as there is no need to track status/switch count.
                 *NOTE: all capacitors should use the same table.
-                
-            recordMode: mode for recording mysql recorders. 'a' for append or
-                'w' to purge data before writing. Append will reduce overhead,
-                but you had better make sure duplicate data isn't inserted by
-                accident.
-            
-        TODO: add controllable DERs
-                
         """
         # Ensure flags are compatible.
         if controlFlag:
@@ -170,9 +159,6 @@ class individual:
         
         # set database object
         self.dbObj = dbObj
-        
-        # set recordMode
-        self.recordMode = recordMode
         
         # Set the control flag
         self.controlFlag = controlFlag
@@ -202,7 +188,6 @@ class individual:
             self.genRegChrom(flag=regFlag)
             # Generate capacitor chromosome:
             self.genCapChrom(flag=capFlag)
-            # TODO: DERs
         else:
             # Use the given chromosomes to update the dictionaries.
             self.regChrom = regChrom
@@ -314,7 +299,7 @@ class individual:
             
             # Compute the needed field width to represent the upper tap bound
             # Use + 1 to account for 2^0
-            width = math.ceil(math.log(tb, 2)) + 1
+            width = util.helper.binaryWidth(tb) 
             
             # Define variables as needed based on the flag. I started to try to
             # make micro-optimizations for code factoring, but let's go for
@@ -387,11 +372,81 @@ class individual:
                         abs(self.reg[r]['phases'][phase]['prevState']
                             - self.reg[r]['phases'][phase]['newState'])
                 
-                # Assign indices for this phase
-                self.reg[r]['phases'][phase]['chromInd'] = (s, e)
+                # Ensure the indices for this phase match what was originally
+                # built.
+                if self.reg[r]['phases'][phase]['chromInd'] != (s, e):
+                    raise UserWarning(('The original regulator chromosome '
+                                       'indices do not match what individual '
+                                       'calculated!'))
                 
                 # Increment start index.
                 s += len(binTuple)
+    
+    # Function below is a DRAFT!
+    '''
+    def genRegChromVoltage(self, regulation=0.1, nominalVoltage=7200,
+                           bandWidthDec=0.2):
+        """Alternative to genRegChrom that plays with voltage set points rather
+        than tap positions.
+        
+        TODO: regulation and nominalVoltage should be part of the 'reg' 
+        dictionary that is input to the individual/application
+        
+        TODO: Handle different regulator modes (specifically remote_node)
+        
+        TODO: dwell_time?
+        
+        NOTE: in the future, we could seed the population via heuristics. Like
+        during times of high PV increase the band_width and decrease the
+        band_center, for example
+        """
+        # Initialize chromosome for regulator and dict to store list indices.
+        self.regChrom = ()
+        # Track chromosome index
+        ind = 0
+        
+        # Loop over the regulators
+        for r, d in self.reg.items():
+            # Compute the voltage bounds.
+            # NOTE: there's a key assumption here: we'll never be setting  
+            # setpoints beyond the 'nominal' range of the regulator. In
+            # reality, if the regulator is operating at a lower/higher voltage
+            # than nominal, it can regulate lower/higher than the nominal
+            # regulation range.
+            # TODO: do we want to allow setpoints outside of the nominal range?
+            
+            # Compute voltage change per tap. Note that GridLAB-D documentation
+            # says: "per tap change ratio equals regulation / raise taps"
+            # This bakes in a symmetric assumption - that's okay.
+            changePerTapDec = regulation / d['raise_taps']
+            voltPerTap = changePerTapDec * nominalVoltage
+            # Compute upper and lower voltage bounds
+            upperBound = nominalVoltage + (nominalVoltage * changePerTapDec
+                                           * d['raise_taps'])
+            lowerBound = nominalVoltage - (nominalVoltage * changePerTapDec
+                                           * d['lower_taps'])
+            # Randomly select a band_center (voltage set-point) 
+            band_center = ((upperBound - lowerBound)*random.random()
+                           + lowerBound)
+            
+            # For now, fix band_width. Note GridLAB-D 
+            # TODO: do we want to randomly pick the band_width? This would
+            # increase the search space, but could help drive toward a more
+            # optimal solution (there may be times of the day where you want
+            # more or less sensitivity)
+            band_width = voltPerTap * (1 + 2*bandWidthDec)
+            
+            # Assign the band_width and band_center.
+            self.reg[r]['band_center'] = band_center
+            self.reg[r]['band_width'] = band_width
+            
+            # TODO: don't hard-code (we may support 'REMOTE_NODE' in the
+            # future).
+            self.reg[r]['Control'] = 'OUTPUT_VOLTAGE'
+            
+            # Update the chromosome
+    '''
+            
                 
     def genCapChrom(self, flag):
         """Method to generate an individual's capacitor chromosome.
@@ -416,7 +471,7 @@ class individual:
             modifies self.cap, sets self.capChrom
         """
         # If we're forcing all caps to the same status, determine the binary
-        # representation. TODO: add input checking.
+        # representation.
         if flag < 2:
             capBinary = flag
             capStatus = CAPSTATUS[flag]
@@ -467,7 +522,12 @@ class individual:
                 # Assign to the capacitor
                 self.capChrom += (capBinary,)
                 self.cap[c]['phases'][phase]['newState'] = capStatus
-                self.cap[c]['phases'][phase]['chromInd'] = ind
+                
+                # Ensure indices are lining up.
+                if self.cap[c]['phases'][phase]['chromInd'] != ind:
+                    raise UserWarning(('Pre-determined chromosome index '
+                                       'does not match index determined by '
+                                       'individual!'))
                 
                 # Increment the switch counter if applicable
                 if (self.controlFlag == 0
@@ -594,24 +654,17 @@ class individual:
             # Grab the time interval from the energy table.
             tInt = self.recorders['energy']['properties']['interval']
             
-            # TODO: The functionality of building regulator and capacitor 
-            # recorder dicionaries probably belongs in util.gld.
-            
             # Loop over regulators and add recorders.
             for reg in self.reg:
-                # Build the property list.
-                propList = \
-                    list(chain.from_iterable(('tap_' + p + '_change_count',
-                                              'tap_' + p) \
-                                             for p in self.reg[reg]['phases']))
-                # Build the dictionary defining the recorder.
-                recordDict = {'objType': 'recorder',
-                              'properties': {'parent': reg,
-                                             'table': 'reg',
-                                             'interval': tInt,
-                                             'propList': propList,
-                                             'limit': -1}
-                              }
+                # Initialize dictionary
+                recordDict = {'objType': 'recorder'}
+                # Get the dictionary of properties
+                recordDict['properties'] = \
+                    util.gld.getRegOrCapRecordDict(objName=reg,
+                                                   table='reg',
+                                                   objType='reg',
+                                                   timeInterval=tInt,
+                                                   limit=-1)
                 
                 # Add the recorder.
                 tr = self.addRecorder(recordDict=recordDict, writeObj=writeObj)
@@ -621,24 +674,18 @@ class individual:
                 
             # Loop over capacitors and add recorders.
             for cap in self.cap:
-                # Build the property list.
-                propList = \
-                    list(chain.from_iterable(('cap_' + p + '_switch_count',
-                                              'switch' + p) \
-                                             for p in self.cap[cap]['phases']))
-                # Build the dictionary defining the recorder.
-                recordDict = {'objType': 'recorder',
-                              'properties': {'parent': cap,
-                                             'table': 'cap',
-                                             'interval': tInt,
-                                             'propList': propList,
-                                             'limit': -1,
-                                             }
-                              }
+                # Initialize dictionary
+                recordDict = {'objType': 'recorder'}
+                # Get the dictionary of properties
+                recordDict['properties'] = \
+                    util.gld.getRegOrCapRecordDict(objName=cap,
+                                                   table='cap',
+                                                   objType='cap',
+                                                   timeInterval=tInt,
+                                                   limit=-1)
                 
-                # Add the recorder
+                # Add the recorder.
                 tc = self.addRecorder(recordDict=recordDict, writeObj=writeObj)
-                
                 
             # Track the capacitor table
             self.capTable = tc
@@ -657,14 +704,9 @@ class individual:
         rD['properties']['table'] = (rD['properties']['table']
                                      + self.tableSuffix)
         
-        # Add the recordMode to the dictionary
-        rD['properties']['mode'] = self.recordMode
-        
         # recorders and group_recorders need handled differently.
         if rD['objType'] == 'recorder':
             # Add the recorder.
-            # TODO: This function will probably be adapted to add a return for
-            # column names. When that happens, need to adapt this.
             writeObj.addMySQLRecorder(**rD['properties'])
             # In this case, we can grab the columns directly from the
             # rD.
@@ -693,6 +735,7 @@ class individual:
         self.modelOutput = util.gld.runModel(modelPath=(self.outDir + '/'
                                                         + self.modelPath),
                                              gldPath=self.gldPath)
+        # TODO: Handle a failed GridLAB-D run (catch a CalledProcessError)
         # If a model failed to run, print to the console.
         if self.modelOutput.returncode:
             print("FAILURE! Individual {}'s model gave non-zero returncode.".format(self.uid))

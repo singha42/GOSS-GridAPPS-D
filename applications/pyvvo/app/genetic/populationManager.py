@@ -46,9 +46,9 @@ class populationManager:
                                   'uid': uid,
                                   'kill': kill})
         
-    def wait(self, timeout=None):
+    def wait(self):
         """Simple method to wait until cleanup is done."""
-        self.cleanupQ.join(timeout=timeout)
+        self.cleanupQ.join()
         
 def cleanupThread(cleanupQ, uidQ, dbObj):
     """Function to cleanup individuals in the cleanupQ, and when complete, put

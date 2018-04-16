@@ -3,21 +3,24 @@ Created on Aug 15, 2017
 
 @author: thay838
 '''
-from genetic import individual
-from genetic import populationManager
+# Standard library:
 import math
 import random
 import os
 from queue import Queue
-import util.helper
 import threading
 import sys
 import copy
 
+# pyvvo
+from genetic.individual import individual, CAPSTATUS
+from genetic import populationManager
+import util.helper
+
 class population:
 
     def __init__(self, strModel, numInd, numGen, inPath, outDir, reg, cap,
-                 starttime, stoptime, timezone, dbObj,
+                 starttime, stoptime, timezone, dbObj, recorders,
                  numModelThreads=os.cpu_count(),
                  costs = {'realEnergy': 0.00008,
                           'powerFactorLead': {'limit': 0.99, 'cost': 0.1},
@@ -27,7 +30,8 @@ class population:
                  probabilities = {'top': 0.2, 'weak': 0.8, 'mutate': 0.2,
                                   'cross': 0.7, 'capMutate': 0.1,
                                   'regMutate': 0.05},
-                 baseControlFlag=None):
+                 baseControlFlag=None,
+                 randomSeed=None):
         """Initialize a population of individuals.
         
         INPUTS:
@@ -44,17 +48,18 @@ class population:
             dbObj: Initialized util/db.db object.
                 TODO: we need to make sure that the number of available
                 connections is not less than the number of model threads.
+            recorders: dictionary defining recorders which individuals use for
+                adding recorders to their models. Check out genetic.individual
+                documentation for more details.
             numModelThreads: number of threads for running models. Since the
                 threads start subprocesses, this corresponds to number of
                 cores used for simulation.
-                
             costs: Dictionary describing costs associated with model fitness.
                 energy: price of energy, $/Wh
                 tapChange: cost to move one tap one position, $
                 capSwitch: cost to switch a single capacitor phase, $
                 undervoltage: cost of undervoltage violations, $.
                 overvoltage: cost of overvoltage violations, $.
-                    
             probabilities: Dictionary describing various probabilities
                 associated with the genetic algorithm.
                 
@@ -72,13 +77,24 @@ class population:
                     mutated.
             baseControlFlag: control flag for baseline individual. See inputs
                 to an individual's constructor for details.
+            randomSeed: integer to seed the random number generator. Python is
+                smart enough to seed for all modules below.
         """
+        # Seed the random number generator.
+        random.seed(randomSeed)
+        
         # Set timezone
         self.timezone = timezone
         # Set database object
         self.dbObj = dbObj
-        # TODO: rather than being input, reg and cap should be read from the
-        # CIM.
+        
+        # Set recorders
+        self.recorders = recorders
+                    
+        # Get a population manager for dealing out UIDs and cleaning up the
+        # database.
+        self.popMgr = populationManager.populationManager(dbObj=dbObj,
+                                                          numInd=numInd)
         
         # Initialize list to hold all individuals in population.
         self.individualsList = []
@@ -88,9 +104,6 @@ class population:
 
         # Assign probabilites.
         self.probabilities = probabilities
-
-        # Seed random module
-        random.seed()
         
         # Set the number of generations and individuals.
         self.numGen = numGen
@@ -115,22 +128,14 @@ class population:
         
         # Start the threads to be used for running GridLAB-D models. These 
         # models are run in a seperate subprocess, so we need to be sure this
-        # is limited to the number of available cores. Note that each
-        # individual will update the fitSum after completion. The fitSumLock
-        # will be used to ensure that 
+        # is limited to the number of available cores.
         for _ in range(numModelThreads):
             t = threading.Thread(target=writeRunEval, args=(self.modelQueue,
                                                             self.costs,
-                                                            self.fitSum
                                                             )
                                  )
             self.modelThreads.append(t)
             t.start()
-            
-        # Get a population manager for dealing out UIDs and cleaning up the
-        # database.
-        self.popMgr = populationManager.populationManager(dbObj=dbObj,
-                                                          numInd=numInd)
         
     def prep(self, starttime, stoptime, strModel, cap, reg, keep=0.1):
         """Method to 'prepare' a population object. This method has two uses:
@@ -158,6 +163,14 @@ class population:
         # object will modify reg and cap, make deep copies.
         self.reg = copy.deepcopy(reg)
         self.cap = copy.deepcopy(cap)
+        
+        # Define some common inputs for individuals
+        self.indInputs = {'reg': self.reg, 'cap': self.cap,
+                          'starttime': self.starttime,
+                          'stoptime': self.stoptime,
+                          'timezone': self.timezone,
+                          'dbObj': self.dbObj,
+                          'recorders': self.recorders}
         
         # If the population includes a 'baseline' model, we need to track it.
         # TODO: May want to update this to track multiple baseline individuals
@@ -208,11 +221,6 @@ class population:
         
         TODO: Make more flexible.
         """
-        # Define some common inputs for individuals
-        inputs = {'reg': self.reg, 'cap': self.cap,
-                  'starttime': self.starttime, 'stoptime': self.stoptime,
-                  'timezone': self.timezone, 'dbObj': self.dbObj}
-        
         # Create baseline individual.
         if self.baseControlFlag is not None:
             # Set regFlag and capFlag
@@ -224,7 +232,7 @@ class population:
                 regFlag = capFlag = 4
              
             # Add a baseline individual with the given control flag   
-            self.self.individualsList.append(individual.individual(**inputs,
+            self.individualsList.append(individual(**self.indInputs,
                                              uid=self.popMgr.getUID(),
                                              regFlag=regFlag,
                                              capFlag=capFlag,
@@ -235,48 +243,48 @@ class population:
         
         # Create 'extreme' indivuals - all caps in/out, regs maxed up/down
         # Control flag of 0 for manual control
-        for n in range(len(individual.CAPSTATUS)):
+        for n in range(len(CAPSTATUS)):
             for regFlag in range(2):
-                ind = individual.individual(**inputs,
-                                            uid=self.popMgr.getUID(),
-                                            regFlag=regFlag,
-                                            capFlag=n,
-                                            controlFlag=0
-                                            )
-                self.self.individualsList.append(ind)
+                ind = individual(**self.indInputs,
+                                 uid=self.popMgr.getUID(),
+                                 regFlag=regFlag,
+                                 capFlag=n,
+                                 controlFlag=0
+                                )
+                self.individualsList.append(ind)
                 
         # Create individuals with biased regulator and capacitor positions
         # TODO: Stop hard-coding the number.
         for _ in range(4):
-            ind = individual.individual(**inputs,
-                                        uid=self.popMgr.getUID(),
-                                        regFlag=2,
-                                        capFlag=2, 
-                                        controlFlag=0
-                                        )
-            self.self.individualsList.append(ind)
+            ind = individual(**self.indInputs,
+                             uid=self.popMgr.getUID(),
+                             regFlag=2,
+                             capFlag=2, 
+                             controlFlag=0
+                            )
+            self.individualsList.append(ind)
         
         # Randomly create the rest of the individuals.
         while len(self.individualsList) < self.numInd:
             # Initialize individual.
-            ind = individual.individual(**inputs,
-                                        uid=self.self.popMgr.getUID(),
-                                        regFlag=5,
-                                        capFlag=5,
-                                        controlFlag=0
-                                        )
-            self.self.individualsList.append(ind)
+            ind = individual(**self.indInputs,
+                             uid=self.popMgr.getUID(),
+                             regFlag=5,
+                             capFlag=5,
+                             controlFlag=0
+                            )
+            self.individualsList.append(ind)
         
     def ga(self):
         """Main function to run the genetic algorithm.
         """
         g = 0
         # Put all individuals in the queue for processing.
-        for individual in self.individualsList:
-            self.modelQueue.put_nowait({'individual':individual,
-                                 'strModel': self.strModel,
-                                 'inPath': self.inPath,
-                                 'outDir': self.outDir})
+        for ind in self.individualsList:
+            self.modelQueue.put_nowait({'individual':ind,
+                                        'strModel': self.strModel,
+                                        'inPath': self.inPath,
+                                        'outDir': self.outDir})
         # Loop over the generations
         while g < self.numGen:
             # Wait until all models have been run and evaluated.
@@ -308,7 +316,9 @@ class population:
             # Increment generation counter.
             g += 1
             
-            # TODO: performing this check again is annoyingly inefficient
+            # This could probably be refactored, but anyways...
+            # perform natural selection, crossing, mutation, and model runs if
+            # we're not in the last generation.
             if g < self.numGen:
                 # Select the fittest individuals and some unfit ones.
                 self.naturalSelection()
@@ -338,16 +348,15 @@ class population:
         # Determine how many individuals to keep for certain.
         k = math.ceil(self.probabilities['top'] * len(self.individualsList))
         
-        # TODO: update for 'population manager' (no more files to delete)
         # Loop over the unfit individuals, and either delete or keep based on
         # the weakProb
-        ind = 0
-        while ind < len(self.individualsList):
+        i = 0
+        while i < len(self.individualsList):
             # If we are past the k'th individual and the random draw mandates
             # it, kill it.
-            if (ind >= k) and (random.random() < self.probabilities['weak']):
+            if (i >= k) and (random.random() < self.probabilities['weak']):
                 # Remove indiviual from individualsList, cleanup.
-                ind = self.individualsList.pop(ind)
+                ind = self.individualsList.pop(i)
                 self.popMgr.clean(tableSuffix=ind.tableSuffix, uid=ind.uid,
                                   kill=True)
                 # No need to increment the index since we removed the 
@@ -356,14 +365,13 @@ class population:
             
             # Add the cost to the fit sum, increment the index. Note that the 
             # fit sum gets zeroed out in the 'prep' function
-            self.fitSum += self.individualsList[ind].costs['total']
-            ind += 1
+            self.fitSum += self.individualsList[i].costs['total']
+            i += 1
         
         # Create weights by standard cost weighting.
         self.rouletteWeights = []
-        for individual in self.individualsList:
-            self.rouletteWeights.append((individual.costs['total'] 
-                                         / self.fitSum))
+        for ind in self.individualsList:
+            self.rouletteWeights.append((ind.costs['total'] / self.fitSum))
             '''
             self.rouletteWeights.append(1 / (individual.costs['total'] 
                                              / self.fitSum))
@@ -441,18 +449,14 @@ class population:
             # in queue for processing.
             for i in range(len(regChroms)):
                 # Initialize new individual
-                ind = individual.individual(uid=self.popMgr.getUID(), 
-                                            regChrom=regChroms[i],
-                                            capChrom=capChroms[i],
-                                            reg=_individualsList[0].reg,
-                                            cap=_individualsList[0].cap,
-                                            parents=parents,
-                                            starttime=self.starttime,
-                                            stoptime=self.stoptime,
-                                            timezone=self.timezone,
-                                          )
+                ind = individual(**self.indInputs,
+                                 uid=self.popMgr.getUID(), 
+                                 regChrom=regChroms[i],
+                                 capChrom=capChroms[i],
+                                 parents=parents,
+                                )
                 # Put individual in the list and the queue.
-                self.self.individualsList.append(ind)
+                self.individualsList.append(ind)
                 self.addToModelQueue(individual=ind)
         
         """
@@ -532,9 +536,6 @@ def writeRunEval(modelQueue, costs):
             if inDict is None:
                 # If None is returned, we're all done here.
                 modelQueue.task_done()
-                # TODO: we should probably close if an error occurs.
-                #print('Thread {} terminating'.format(os.getpid()),
-                #      flush=True)
                 break
             
             # Write, run, update, and evaluate the individual.
@@ -611,6 +612,7 @@ def crossChrom(chrom1, chrom2):
             
     # Return the new chromosomes
     return [tuple(c1), tuple(c2)]
+
 if __name__ == "__main__":
     pass
 """

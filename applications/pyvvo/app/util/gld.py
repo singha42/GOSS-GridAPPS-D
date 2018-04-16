@@ -60,8 +60,10 @@ like (see computeCosts for more details):
 COSTS = {'realEnergy': 0.00008,
          'powerFactorLead': {'limit': 0.99, 'cost': 0.1},
          'powerFactorLag': {'limit': 0.99, 'cost': 0.1},
-         'tapChange': 0.5, 'capSwitch': 2, 'undervoltage': 0.05,
-         'overvoltage': 0.05}
+         'tapChange': 0.5, 'capSwitch': 2,
+         'undervoltage': {'limit': 228, 'cost': 0.05},
+         'overvoltage': {'limit': 252, 'cost': 0.05}
+        }
 
 Created on Aug 29, 2017
 
@@ -75,9 +77,11 @@ import util.helper
 REG_CHANGE_PROPS = ['tap_A_change_count', 'tap_B_change_count',
                     'tap_C_change_count']
 REG_STATE_PROPS = ['tap_A', 'tap_B', 'tap_C']
+REG_PROPS = REG_CHANGE_PROPS + REG_STATE_PROPS
 CAP_CHANGE_PROPS = ['cap_A_switch_count', 'cap_B_switch_count',
                     'cap_C_switch_count']
 CAP_STATE_PROPS = ['switchA', 'switchB', 'switchC']
+CAP_PROPS = CAP_CHANGE_PROPS + CAP_STATE_PROPS
 MEASURED_POWER = ['measured_power_A', 'measured_power_B', 'measured_power_C']
 MEASURED_ENERGY = ['measured_real_energy']
 TRIPLEX_VOLTAGE = ['measured_voltage_12']
@@ -93,9 +97,6 @@ def runModel(modelPath, gldPath=None):
         PATH must contain gridlab-d/develop/bin
         GLPATH must contain gridlab-d/develop/lib/gridlabd and gridlab-d/develop/share/gridlabd
         CXXFLAGS must be set to include gridlab-d/develop/share/gridlabd
-    
-    
-    TODO: Add support for command line inputs.
     """
     cwd, model = os.path.split(modelPath)
 
@@ -120,7 +121,7 @@ def runModel(modelPath, gldPath=None):
         env = None
     
     # Run command. Note with check=True exception will be thrown on failure.
-    # TODO: with check=True, a CalledProcessError will be raised. This should
+    # With check=True, a CalledProcessError will be raised. This should
     # be handled in some way, but probably outside of this function.
     # NOTE: it's best practice to pass args as a list. If args is a list, using
     # shell=True creates differences across platforms. Just don't do it.
@@ -133,7 +134,6 @@ def translateTaps(lowerTaps, pos):
     """Method to translate tap integer in range 
     [0, lowerTaps + raiseTaps] to range [-lower_taps, raise_taps]
     """
-    # TODO: unit test
     # Hmmm... is it this simple? 
     posOut = pos - lowerTaps
     return posOut
@@ -142,7 +142,6 @@ def inverseTranslateTaps(lowerTaps, pos):
     """Method to translate tap integer in range
         [-lower_taps, raise_taps] to range [0, lowerTaps + raiseTaps]
     """
-    # TODO: unit test
     # Hmmm... is it this simle? 
     posOut = pos + lowerTaps
     return posOut
@@ -171,8 +170,14 @@ def computeCosts(dbObj, energyTable, powerTable, triplexTable, tapChangeCount,
             realEnergy: price of energy in $/Wh
             tapChange: cost ($) of changing one regulator tap one position.
             capSwitch: cost ($) of switching a single capacitor
-            undervoltage: cost of an undervoltage violation
-            overvoltage: cost of an overvoltage violation
+            undervoltage: dict with two fields:
+                limit: voltage threshold for voltage violation. Limit is 
+                    exclusive, a value = to the limit will not inucr a penalty
+                cost: penalty incurred for an undervoltage violation
+            overvoltage: dict with two fields:
+                limit: voltage trheshold for voltage violation. Limit is
+                    exclusive, a value = to the limit will not incur a penalty
+                cost: penalty incurred for an overvoltage violation
             powerFactorLead: dict with two fields:
                 limit: minimum tolerable leading powerfactor
                 cost: cost of a 0.01 pf deviation from the lead limit
@@ -262,16 +267,17 @@ def computeCosts(dbObj, energyTable, powerTable, triplexTable, tapChangeCount,
     # a taller table! That way, we don't have to pull out ALL the data and sift
     # through it, we can use MySQL operations to work on the data and only pull
     # out the stuff we care about.
-    # TODO: These voltage limits should be input (or defined in config, etc.)
-    # TODO: We might want to hang on to more detail beyond total violations.
+    
+    # Note, the returned value here has a 'detail' field which we can exploit
+    # to get more detail on the voltage violations.
     v = dbObj.voltViolationsFromGroupRecorder(baseTable=triplexTable['table'],
-                                              lowerBound=0.95*240,
-                                              upperBound=1.05*240,
+                                              lowerBound=costs['undervoltage']['limit'],
+                                              upperBound=costs['overvoltage']['limit'],
                                               idCol=idCol, tCol=tCol,
                                               starttime=starttime,
                                               stoptime=stoptime)
-    costDict['overvoltage'] = v['high'] * costs['overvoltage']
-    costDict['undervoltage'] = v['low'] * costs['undervoltage']
+    costDict['overvoltage'] = v['high'] * costs['overvoltage']['cost']
+    costDict['undervoltage'] = v['low'] * costs['undervoltage']['cost']
     
     '''
     if voltFilesDir and voltFiles:
@@ -295,182 +301,30 @@ def computeCosts(dbObj, energyTable, powerTable, triplexTable, tapChangeCount,
     costDict['total'] = t
     return costDict
 
-'''
-def violationsFromRecorderFiles(fileDir, files, vNom=120, vTol=6):
-    """Function to read GridLAB-D group_recorder output files and compute
-    voltage violations. All files are assumed to have voltages for the same
-    nodes, just on different phases.
+def getRegOrCapRecordDict(objName, table, objType, timeInterval, limit=-1):
+    """Helper function to build dictionary used to write recorders for
+    regulators or capacitors.
     
-    NOTE: Files should have voltage magnitude only.
+    INPUTS: 
+        objName: name of object to record
+        table: desired table for recording
+        objType: either 'reg' or 'cap'
+        timeInterval: interval for recording
     """
-    # Open all the files, put in list. Get csv reader
-    openFiles = []
-    readers = []
-    for file in files:
-        openFiles.append(open(fileDir + '/' + file, newline=''))
-        readers.append(csv.reader(openFiles[-1]))
+    # We'll record all phases even if they aren't connected
+    # I believe that this is necessary due to how GridLAB-D performs inserts.
+    if objType == 'reg':
+        propList = REG_PROPS
+    elif objType == 'cap':
+        propList = CAP_PROPS
+    else:
+        raise UserWarning("objType must be 'reg' or 'cap'")
     
-    # Read each file up to the headers.
-    # Loop through the files and advance the lines.
-    headers = []
-    for r in readers:
-        h = getGLDFileHeaders(r=r)
-        headers.append(h)
-            
-    # Ensure all headers are the same. If not, raise an error.
-    sameHeaders = True
-    for readerIndex in range(1, len(files)):
-        sameHeaders = sameHeaders and (headers[0] == headers[readerIndex])
-        
-    if not sameHeaders:
-        raise ValueError('Files do not have identical header rows!')
+    # Build the dictionary of properties
+    propDict = {'parent': objName,
+                'table': table,
+                'interval': timeInterval,
+                'propList': propList,
+                'limit': limit}
     
-    # Initialize return.
-    violations = {'time': [], 'low': [], 'high': []}
-    # Compute low and high voltages once.
-    lowV = vNom - vTol
-    highV = vNom + vTol
-    
-    # Read all files line by line and check for voltage violations.
-    while True:
-        # Get the next line for each reader
-        # NOTE: The code below BUILDS IN THE ASSUMPTION that the files are of
-        # the same length. If one iterator declares itself done, we leave the
-        # loop without checking the others. We could use recursion to address
-        # this, but meh. Not worth it.
-        try:
-            lines = [next(r) for r in readers]
-        except StopIteration:
-            break
-            
-        # Ensure all files have the same timestamp (first element in row) for
-        # the given line.
-        sameTime = True
-        for readerIndex in range(1, len(files)):
-            sameTime = sameTime and (lines[0][0] == lines[readerIndex][0])
-            
-        if not sameTime:
-            raise ValueError('There was a timestamp mismatch!')
-        
-        # Add the time to the output, start violations for this time at 0
-        violations['time'].append(lines[0][0])
-        violations['low'].append(0)
-        violations['high'].append(0)
-        
-        # Loop over each element in the row. Since headers are the same, assume
-        # lengths are the same. Note range starts at 1 to avoid the timestamp
-        for colIndex in range(1, len(lines[0])):
-            # Loop over each file, and check for voltage violations.
-            # Don't double count - move on if a violation is found. This means
-            # that if all phases are undervoltage, we count 1 violation. If 1
-            # phase is overvoltage, we count 1 violation.
-            lowFlag = False
-            highFlag = False
-            for line in lines:
-                # If we've incremented both violations, break the loop to move
-                # on to the next column (object)
-                if lowFlag and highFlag:
-                    break
-                # Check for low voltage
-                elif (not lowFlag) and  (float(line[colIndex]) < lowV):
-                    violations['low'][-1] += 1
-                    lowFlag = True
-                elif (not highFlag) and (float(line[colIndex]) > highV):
-                    violations['high'][-1] += 1
-                    highFlag = True
-                
-    # Close all the files
-    for file in openFiles:
-        file.close()
-        
-    return violations
-
-def getGLDFileHeaders(r):
-    """Helper to take a csv reader for a GLD output file, and run through
-    rows until the headers are found.
-    
-    INPUTS: r is a .csv reader. NOTE: NOT a dictionary reader.
-    """
-    while True:
-        line = next(r)
-        # If we're not yet at the row which starts with timestamp, move on
-        if (line[0].strip().startswith('#')) and \
-        (not line[0].strip().startswith(util.constants.GLD_TIMESTAMP)):
-            pass
-        elif line[0].strip().startswith(util.constants.GLD_TIMESTAMP):
-            # The row starts with '# timestamp' --> this is the header row
-            break
-        else:
-            raise ValueError('File had unexpected format!')
-        
-    return line
-'''
-
-'''      
-def voltViolationsFromDump(fName, vNom=120, vTol=6):
-    """Method to read a voltdump file which is recording triplex loads/meters
-    and count high and low voltage violations.
-    
-    NOTE: voltdump should be made with the 'polar' option!
-    
-    NOTE: This is hard-coded to read two-phase triplex, so phase C is not used.
-    
-    INPUTS:
-        fName: Name of the voltdump .csv file.
-        vNom: Nominal voltage magnitude (V)
-        vTol: Tolerance +/- (V).
-        
-    OUTPUTS:
-        violations: dictionary with two fields, 'low' and 'high' representing
-            the total number of single phase voltage violations in the file.
-    """
-    # Intialize return:
-    violations = {'low': 0, 'high': 0}
-    # Compute low and high voltages once.
-    lowV = vNom - vTol
-    highV = vNom + vTol
-    with open(fName, newline='') as f:
-        # Advance the file one line, since the first line is metadata.
-        f.readline()
-        reader = csv.reader(f)
-        headers = reader.__next__()
-        # Note that voltdump reads phases 1 and 2 as A and B.
-        # Get the row indices of the properties we care about.
-        magA = headers.index('voltA_mag')
-        magB = headers.index('voltB_mag')
-        for row in reader:
-            # Grab the voltage magnitudes for the two phases
-            v = (float(row[magA]), float(row[magB]))
-            # For the two phases, increment violations count if one occurs.
-            if (v[0] < lowV) or (v[1] < lowV):
-                violations['low'] += 1
-                
-            if (v[0] > highV) or (v[1] > highV):
-                violations['high'] += 1
-                    
-    return violations
-
-def sumVoltViolations(fileDir, files, vNom=120, vTol=6):
-    """Helper method which calls voltViolationsFromDump in a loop and sums
-        all violations
-        
-    """
-    # Initialize violations count.
-    violations = {'low': 0, 'high': 0}
-    
-    # Loop over each file.
-    for f in files:
-        # Call method to cound violations.
-        v = voltViolationsFromDump(fName=fileDir + '/' + os.path.basename(f),
-                                   vNom=vNom, vTol=vTol)
-        # Add to the running total.
-        violations['low'] += v['low']
-        violations['high'] += v['high']
-        
-    return violations
-'''
-    
-if __name__ == '__main__':
-    result = runModel(modelPath=r'C:\Users\thay838\git_repos\GOSS-GridAPPS-D\applications\pyvvo\app\pmaps\output\subVTest.glm',
-                      gldPath=r'C:\gridlab-d\unconstrained')
-    print('yay')
+    return propDict

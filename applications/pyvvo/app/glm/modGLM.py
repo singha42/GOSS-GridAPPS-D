@@ -12,7 +12,6 @@ Created on Jul 27, 2017
 
 import re
 import os
-import util.gld
 import util.helper
 import csv
 
@@ -44,12 +43,12 @@ HOUSE_REGEX = re.compile(r'\bobject\b(\s+)\bhouse\b')
 GROUP_RECORDER_REGEX = re.compile(r'\bobject\b(\s+)\bgroup_recorder\b')
 OBJY_BY_NAME = r'\bname\b(\s+)("?){}("?)(\s*);'
 VOLT_VAR_REGEX = re.compile(r'\bobject\b(\s+)\bvolt_var_control\b')
+FROM_REGEX = r'\bfrom\b(\s+)("?){}("?)(\s*);'
 # Expression below doesn't work since it can match multiple objects at once...
 # OBJ_BY_TYPE_NAME = r'\bobject\b(\s+)\b{}\b(.+?)\bname\b(\s+)("?){}("?)(\s*);' # Use with re.DOTALL
 
 def readModel(modelIn):
     '''Simple function to read file as string'''
-    # TODO: strip this function out of this file.
     with open(modelIn, 'r') as f:
         s = f.read()
     return s
@@ -126,9 +125,11 @@ class modGLM:
             self.replaceObject(d)
             
             # If we're given a control mode, use it.
-            # TODO: this is case dependent and therefore gross.
-            if ('Control' in reg[r]):
+            try:
                 confPropDict['Control'] = reg[r]['Control']
+            except KeyError:
+                # If we don't have 'Control', nothing to do.
+                pass
             
             # Extract the configuration.
             d2 = self.extractObjectByNameAndType(name=\
@@ -313,7 +314,7 @@ class modGLM:
                 self.strModel = (self.strModel[0:tapeObj['start']]
                                  + self.strModel[tapeObj['end']+1:])
                 
-    def addDatabase(self, hostname='localhost', username='gridlabd',
+    def addDatabase(self, host='localhost', user='gridlabd',
                  password='gridlabd', database='gridlabd', port='3306',
                  socketname='/var/run/mysqld/mysqld.sock', tz_offset=0):
         """Method to add mysql database connection to model
@@ -328,17 +329,11 @@ class modGLM:
         http://gridlab-d.shoutwiki.com/wiki/Mysql
         http://gridlab-d.shoutwiki.com/wiki/Database
         
-        TODO: Add the rest of the options for the database object:
-            clientflags, options, on_init, on_sync, on_term, sync_interval,
-            tz_offset, uses_dst
+        Add more database inputs as necessary.
             
         NOTE: On Brandon's VM, socket location is /var/run/mysqld/mysqld.sock,
         but the 'default' location is /tmp/mysql.sock
         """
-        # TODO: Compute tz_offset from a given timezone, assuming the mysql
-        # server is running on local time.
-        
-        
         # Construct the beginning of the necessary string
         dbStr = (
             "object database {{\n"
@@ -348,7 +343,7 @@ class modGLM:
             '   schema "{database}";\n'
             '   port {port};\n'
             '   tz_offset {tz_offset};\n'
-            ).format(host=hostname, usr=username, pwd=password,
+            ).format(host=host, usr=user, pwd=password,
                      database=database, port=port, tz_offset=tz_offset)
         # If we're on Mac or Linux, need to include the sockenamae
         if os.name == 'posix':
@@ -422,9 +417,10 @@ class modGLM:
         INPUTS: see recorder in GridLAB-D Wiki. prop short for property -->
             (Python reserverd keyword)
             
-        TODO: this should leverage addObject, since this only adds to the
+        NOTE: maybe this should leverage addObject, since this only adds to the
         beginning of the file, which makes it all too easy to get GridLAB-D
-        errors if tape isn't defined yet.
+        errors if tape isn't defined yet. The tricky bit is exposing the value
+        via the class player part. 
         """
         # Build string
         s = (
@@ -461,8 +457,6 @@ class modGLM:
         
     def repeatMessages(self, val=1):
         """Method to set 'suppress_repeat_messages'
-        
-        TODO: unit test.
         """
         # See if the model already has the constant
         m = SUPPRESS_REGEX.search(self.strModel)
@@ -477,8 +471,6 @@ class modGLM:
                          
     def toggleProfile(self, val=0):
         """Method to toggle the profiler
-        
-        TODO: unit test.
         """
         # See if the model has the profiler set already
         m = PROFILER_REGEX.search(self.strModel)
@@ -533,7 +525,6 @@ class modGLM:
         swingIter = OBJ_REGEX.finditer(self.strModel, 0, sInd)
         
         # Loop over the iterator until the last one. This feels dirty.
-        # TODO: Make this more efficient?
         for m in swingIter:
             pass
         
@@ -543,12 +534,10 @@ class modGLM:
         return {'name': sName['name']['prop'], 'start': sInd, 'end': eInd,
                 'obj': self.strModel[sInd:eInd]}
     
-    def recordSwing(self, energyInterval, powerInterval=60, suffix=0):
-        """Add recorder to model to record the power flow on the swing.
+    def meterSwing(self):
+        """Ensure we have a meter for the swing node of our model.
         
         NOTE: swing will be changed from node to meter if it's a node
-        
-        NOTE: This is for a database recorder.
         
         INPUTS:
             interval: interval (seconds) to record
@@ -574,7 +563,7 @@ class modGLM:
             
             # Splice in the new object
             self.replaceObject(swing)
-            recorderParent = swing['name']
+            meterName = swing['name']
             
         elif substationMatch is not None:
             # Add a meter to track the substation.
@@ -589,38 +578,31 @@ class modGLM:
                 
             # Add 'parent' and 'name'
             propDict['parent'] = swing['name']
-            propDict['name'] = 'swing_recorder'
-            recorderParent = propDict['name']
+            propDict['name'] = 'swing_meter'
+            meterName = propDict['name']
             
             # Add a meter object
             self.addObject(objType='meter', properties=propDict, place='end')
             
+            # We've added the meter, but now we need to take all objects 
+            # connected to the substation node and connect them to the meter
+            # instead of the substation object.
+            
+            # First, compile the regular expression
+            regExp = re.compile(FROM_REGEX.format(swing['name']))
+            
+            # Replace all connections to the swing with connections to the
+            # meter.
+            self.strModel = regExp.sub('from {};'.format(meterName),
+                                       self.strModel)
+            
         elif meterMatch is not None:
-            recorderParent = swing['name']
+            meterName = swing['name']
         else:
             # Raise error
             raise UnexpectedSwingType()
         
-        # Define swing tables to use
-        powerTable = 'swing_power_' + str(suffix)
-        energyTable = 'swing_energy_' + str(suffix)
-        
-        # Create recorders. Power first
-        self.addMySQLRecorder(parent=recorderParent, table=powerTable,
-                         propList=util.gld.MEASURED_POWER,
-                         interval=powerInterval)
-        # Now energy
-        self.addMySQLRecorder(parent=recorderParent, table=energyTable,
-                              propList=util.gld.MEASURED_ENERGY,
-                              interval=energyInterval)
-        
-        # Return the name of the table and powerProperties
-        p = {'table': powerTable, 'columns': util.gld.MEASURED_POWER,
-             'interval': powerInterval}
-        e = {'table': energyTable, 'columns': util.gld.MEASURED_ENERGY,
-             'interval': energyInterval}
-        
-        return {'power': p, 'energy': e}
+        return meterName
     
     def addGroupToObjects(self, objectRegex, groupName):
         """Method to add a groupid to a given type of object.
@@ -727,7 +709,7 @@ class modGLM:
                 before use OUTSIDE of GridLAB-D. Maybe all this is true...
             limit: Maximum number of rows. Negative means no limit.
             
-        TODO: Add more properties
+        Add more properties as needed.
         """
         # Add formatted string to end of model.
         recorder = ('\n'
@@ -1011,7 +993,7 @@ class modGLM:
     def setupModel(self, starttime=None, stoptime=None, timezone=None,
                    vSource=69715.065, playerFile=None, database=None,
                    profiler=0, triplexGroup=None,
-                   triplex_group_recorder=None, powerflowFlag=False):
+                   powerflowFlag=False, swingMeter=True):
         """Function to add the basics to get a running model. Designed with 
         the output from Tom McDermott's CIM exporter in mind.
         
@@ -1021,6 +1003,8 @@ class modGLM:
         TODO: Document inputs when this is done. Database inputs are going to
             need to be added.
         """
+        # Relax naming rules
+        self.addLine(line='#set relax_naming_rules=1')
         
         # Add definition of source voltage
         if vSource:
@@ -1042,7 +1026,7 @@ class modGLM:
             # Since we're using a player file, we'll need the tape module.
             self.addModule('tape')
         
-        # TODO: Get database inputs rather than just using the default.
+        # Add database and MySQL module if necessary.
         if database:
             self.addDatabase(**database)
             # Add mysql modules
@@ -1066,7 +1050,12 @@ class modGLM:
         if triplexGroup:
             self.addGroupToObjects(objectRegex=TRIPLEX_LOAD_REGEX,
                                    groupName=triplexGroup)
+            
+        # If the swing bus isn't a meter object, we need to add a meter to it
+        # so we can measure the desired properties.
+        swingMeterName = self.meterSwing()
         
+        return swingMeterName
         '''
         # Add group_recorders for triplex group. Note that we have to create
         # two recorders - one for phase 1, one for phase 2. We'll assume
@@ -1388,7 +1377,9 @@ class modGLM:
             # Save this row, it has our headers.
             headers = row
             
-            # TODO: should we use a DictReader? Would the be more efficient?
+            # Removed 'to-do' note since this is going to change once the 
+            # function to get zip coefficients is complete
+            # Should we use a DictReader? Would the be more efficient?
             # We're building our own dict each time here...
             
             # Loop over each row

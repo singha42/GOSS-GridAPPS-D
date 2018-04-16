@@ -13,8 +13,9 @@ import os
 COSTS = {'realEnergy': 0.00008,
          'powerFactorLead': {'limit': 0.99, 'cost': 0.1},
          'powerFactorLag': {'limit': 0.99, 'cost': 0.1},
-         'tapChange': 0.5, 'capSwitch': 2, 'undervoltage': 0.05,
-         'overvoltage': 0.05}
+         'tapChange': 0.5, 'capSwitch': 2, 
+         'undervoltage': {'limit': 228, 'cost': 0.05},
+         'overvoltage': {'limit': 252, 'cost': 0.05}}
 # Stuff for GA
 NUM_THREADS = 6
 NUM_IND = 6

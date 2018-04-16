@@ -28,19 +28,27 @@ def getComplex(s):
             Ex: +15-20d V
             Ex: +12-3.14r I
             
-    TODO: unit test! There are some sample inputs in the __main__ section.
+    Note: There are some sample inputs in the __main__ section.
     """
     # First, strip whitespace, then split on whitespace to strip off the unit
     t = s.strip().split()
+    # Grab complex number part of the string.
+    c = t[0]
+    try:
+        # Grab the unit, if it's there
+        u = t[1]
+    except IndexError:
+        # There's no unit. 
+        u = None
     
     # Detect form and take action
-    if RECT_EXP.fullmatch(t[0]):
+    if RECT_EXP.fullmatch(c):
         # If it's already in rectangular form, there's not much work to do
-        n = complex(t[0])
+        n = complex(c)
     else:
         # Extract the first and second terms
-        magFloat = float(FIRST_EXP.match(t[0]).group())
-        phaseStr = SECOND_EXP.search(t[0]).group()
+        magFloat = float(FIRST_EXP.match(c).group())
+        phaseStr = SECOND_EXP.search(c).group()
         # If the number doesn't fit the form, raise exception.
         if (not magFloat) or (not phaseStr):
             raise ValueError(('Inputs to getComplex must have a sign defined '
@@ -58,11 +66,11 @@ def getComplex(s):
         # Convert to complex.
         n = (magFloat * cmath.exp(1j * phaseFloat))
         
-    return n, t[1]
+    return n, u
 
 def powerFactor(n):
     """Function to compute power factor given a complex power value
-    TODO: unit test! Will this work if we're exporting power? I think so...
+    Will this work if we're exporting power? I think so...
     """
     # Real divided by apparent
     pf = n.real / n.__abs__()
@@ -75,11 +83,18 @@ def powerFactor(n):
     else:
         return (pf, 'lag')
     
+def binaryWidth(n):
+    """Compute length of binary representation of an integer.
+    """
+    # Use + 1 to account for 2^0
+    width = math.ceil(math.log(n, 2)) + 1
+    
+    return width
+
 def bin2int(binList):
         """Take list representing binary number (ex: [0, 1, 0, 0, 1]) and 
         convert to an integer
         """
-        # TODO: unit test
         # initialize number and counter
         n = 0
         k = 0
@@ -330,8 +345,6 @@ def timeInfoForZIP(starttime, stoptime, zipInterval=3600):
     """
     # Ensure times are within the same ZIP modeling window. For now, hard-code
     # interval to same hour.
-    # TODO: Make the 'delta' an input? or a constant? Anyways, don't hide it
-    # here
     delta = dtToUTC(stoptime) - dtToUTC(starttime)
     assert delta.total_seconds() <= zipInterval
     
